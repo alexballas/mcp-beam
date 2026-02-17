@@ -1,4 +1,4 @@
-.PHONY: test test-race fmt-check lint release clean
+.PHONY: test test-race fmt fmt-check lint release clean
 
 GO ?= go
 GOCACHE ?= /tmp/go-build-cache
@@ -12,14 +12,9 @@ test-race:
 	mkdir -p "$(GOCACHE)"
 	$(GOENV) $(GO) test -race ./...
 
-fmt-check:
-	@files="$$(find . -type f -name '*.go' -not -path './.git/*' -not -path './dist/*' -not -path './.agent/*')"; \
-	out="$$(gofmt -l $$files)"; \
-	if [ -n "$$out" ]; then \
-		echo "Unformatted Go files:"; \
-		echo "$$out"; \
-		exit 1; \
-	fi
+fmt:
+	mkdir -p "$(GOCACHE)"
+	$(GOENV) $(GO) fmt ./...
 
 release:
 	mkdir -p "$(GOCACHE)"

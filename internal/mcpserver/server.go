@@ -629,9 +629,9 @@ func staticTools() []tool {
 						"description": "The target device ID or exact name. Obtain this by calling 'list_local_hardware' first.",
 					},
 					"transcode": map[string]any{
-						"type":    "string",
-						"default": "auto",
-						"enum":    []string{"auto", "always", "never"},
+						"type":        "string",
+						"default":     "auto",
+						"enum":        []string{"auto", "always", "never"},
 						"description": "Whether to transcode the media on the fly. Defaults to 'auto'.",
 					},
 					"subtitles_path": map[string]any{
