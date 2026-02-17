@@ -595,7 +595,7 @@ func staticTools() []tool {
 	return []tool{
 		{
 			Name:        "list_local_hardware",
-			Description: "Discover Chromecast and DLNA/UPnP renderers on the local network.",
+			Description: "Discover Chromecast, Smart TVs, and DLNA/UPnP media renderers on the local network. Always call this first to find available 'target_device' IDs or names before attempting to cast media.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -603,12 +603,12 @@ func staticTools() []tool {
 						"type":        "integer",
 						"minimum":     100,
 						"default":     defaultDiscoveryTimeoutMS,
-						"description": "Discovery timeout in milliseconds.",
+						"description": "Discovery timeout in milliseconds. Increase this if devices are slow to respond.",
 					},
 					"include_unreachable": map[string]any{
 						"type":        "boolean",
 						"default":     false,
-						"description": "Include devices that fail immediate reachability checks.",
+						"description": "Include devices that fail immediate reachability checks. Useful if a known device is temporarily sleeping.",
 					},
 				},
 				"additionalProperties": false,
@@ -616,25 +616,27 @@ func staticTools() []tool {
 		},
 		{
 			Name:        "beam_media",
-			Description: "Start media playback to a selected local device.",
+			Description: "Cast or stream media (video, audio, etc.) to a selected local Smart TV, Chromecast, or UPnP/DLNA device. You must provide a valid target_device ID or name.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"source": map[string]any{
 						"type":        "string",
-						"description": "Absolute local file path or http/https URL.",
+						"description": "The absolute local file path (e.g., /home/user/movie.mp4) or a valid HTTP/HTTPS URL of the media to cast.",
 					},
 					"target_device": map[string]any{
 						"type":        "string",
-						"description": "Preferred device ID, fallback exact name.",
+						"description": "The target device ID or exact name. Obtain this by calling 'list_local_hardware' first.",
 					},
 					"transcode": map[string]any{
 						"type":    "string",
 						"default": "auto",
 						"enum":    []string{"auto", "always", "never"},
+						"description": "Whether to transcode the media on the fly. Defaults to 'auto'.",
 					},
 					"subtitles_path": map[string]any{
-						"type": "string",
+						"type":        "string",
+						"description": "Optional absolute local file path to a subtitle file (e.g., .srt, .vtt) to load with the media.",
 					},
 				},
 				"required":             []string{"source", "target_device"},
@@ -643,16 +645,22 @@ func staticTools() []tool {
 		},
 		{
 			Name:        "stop_beaming",
-			Description: "Stop active playback on a selected device/session.",
+			Description: "Stop, or halt active media playback/casting on a selected device or session.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"target_device": map[string]any{
-						"type": "string",
+						"type":        "string",
+						"description": "The device ID or exact name of the device to stop playing on.",
 					},
 					"session_id": map[string]any{
-						"type": "string",
+						"type":        "string",
+						"description": "The unique session ID to stop. This is returned by a successful 'beam_media' call.",
 					},
+				},
+				"anyOf": []map[string]any{
+					{"required": []string{"target_device"}},
+					{"required": []string{"session_id"}},
 				},
 				"additionalProperties": false,
 			},
