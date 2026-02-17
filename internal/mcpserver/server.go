@@ -658,10 +658,7 @@ func staticTools() []tool {
 						"description": "The unique session ID to stop. This is returned by a successful 'beam_media' call.",
 					},
 				},
-				"anyOf": []map[string]any{
-					{"required": []string{"target_device"}},
-					{"required": []string{"session_id"}},
-				},
+				"minProperties":        1,
 				"additionalProperties": false,
 			},
 		},
