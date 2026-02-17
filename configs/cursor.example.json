@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "mcp-beam": {
+      "command": "/absolute/path/to/mcp-beam",
+      "args": [],
+      "env": {
+        "MCP_BEAM_REDACT_PATHS": "true"
+      }
+    }
+  }
+}
