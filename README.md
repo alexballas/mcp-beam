@@ -40,7 +40,17 @@ Get beaming in a few minutes.
 
 ### 1) Add `mcp-beam` to your MCP host config
 
-Recommended configuration:
+CLI one-liners:
+
+```bash
+# Claude Code
+claude mcp add --scope user mcp-beam -- go run go2tv.app/mcp-beam@latest
+
+# Codex
+codex mcp add mcp-beam -- go run go2tv.app/mcp-beam@latest
+```
+
+Generic JSON configuration (for MCP hosts using `mcpServers`):
 
 ```json
 {
@@ -50,10 +60,7 @@ Recommended configuration:
       "args": [
         "run",
         "go2tv.app/mcp-beam@latest"
-      ],
-      "env": {
-        "MCP_BEAM_REDACT_PATHS": "true"
-      }
+      ]
     }
   }
 }
@@ -138,10 +145,7 @@ macOS/Linux:
       "args": [
         "-lc",
         "cd /absolute/path/to/mcp-beam && go run ."
-      ],
-      "env": {
-        "MCP_BEAM_REDACT_PATHS": "true"
-      }
+      ]
     }
   }
 }
@@ -158,10 +162,7 @@ Windows PowerShell:
         "-NoProfile",
         "-Command",
         "Set-Location 'C:\\absolute\\path\\to\\mcp-beam'; go run ."
-      ],
-      "env": {
-        "MCP_BEAM_REDACT_PATHS": "true"
-      }
+      ]
     }
   }
 }
@@ -215,10 +216,7 @@ MCP config for a local binary:
   "mcpServers": {
     "mcp-beam": {
       "command": "/absolute/path/to/mcp-beam",
-      "args": [],
-      "env": {
-        "MCP_BEAM_REDACT_PATHS": "true"
-      }
+      "args": []
     }
   }
 }
@@ -390,7 +388,6 @@ Common tool error codes:
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `MCP_BEAM_REDACT_PATHS` | `true` | Redacts absolute paths in manager logs. |
 | `MCP_BEAM_STRICT_PATH_POLICY` | `false` | Enables strict file/subtitle path allowlist enforcement. |
 | `MCP_BEAM_ALLOWED_PATH_PREFIXES` | empty | Comma-separated absolute prefixes allowed in strict mode. |
 | `MCP_BEAM_ALLOW_LOOPBACK_URLS` | `false` | Allows `localhost`/loopback URL hosts when `true`. |
@@ -407,10 +404,8 @@ Security controls:
 - Wildcard bind addresses (`0.0.0.0`, `::`) are blocked by default.
 - Temporary media routes use random, unguessable tokens.
 - Session ownership is process-local and in-memory.
-- Manager logs redact absolute paths by default.
 
 Recommended production baseline:
-- Keep `MCP_BEAM_REDACT_PATHS=true`.
 - Keep `MCP_BEAM_ALLOW_LOOPBACK_URLS=false` unless explicitly needed for local-only testing.
 - Keep `MCP_BEAM_ALLOW_WILDCARD_BIND=false`.
 - Enable `MCP_BEAM_STRICT_PATH_POLICY=true` with explicit `MCP_BEAM_ALLOWED_PATH_PREFIXES`.

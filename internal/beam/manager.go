@@ -90,13 +90,10 @@ type Manager struct {
 	allowedPathPrefixes []string
 	allowLoopbackURLs   bool
 	allowWildcardBind   bool
-	redactPaths         bool
 
 	retryAttempts    int
 	retryBaseBackoff time.Duration
 	retryMaxBackoff  time.Duration
-
-	logf func(format string, args ...any)
 
 	cleanupLoopCancel context.CancelFunc
 	cleanupLoopDone   chan struct{}
@@ -186,11 +183,9 @@ func NewManager(discovery deviceLister, castFactory adapters.CastFactory, dlnaFa
 		allowedPathPrefixes:    allowedPathPrefixes,
 		allowLoopbackURLs:      boolEnv("MCP_BEAM_ALLOW_LOOPBACK_URLS", false),
 		allowWildcardBind:      boolEnv("MCP_BEAM_ALLOW_WILDCARD_BIND", false),
-		redactPaths:            boolEnv("MCP_BEAM_REDACT_PATHS", true),
 		retryAttempts:          defaultRetryAttempts,
 		retryBaseBackoff:       defaultRetryBaseBackoff,
 		retryMaxBackoff:        defaultRetryMaxBackoff,
-		logf:                   func(string, ...any) {},
 		cleanupLoopCancel:      cleanupCancel,
 		cleanupLoopDone:        make(chan struct{}),
 		sessionsByID:           map[string]*session{},
@@ -258,7 +253,7 @@ func (m *Manager) beamChromecast(ctx context.Context, req domain.BeamRequest, de
 	if err != nil {
 		return nil, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to create Chromecast client: %v", err))
 	}
-	if err := m.withRetry(ctx, "chromecast_connect", func() error {
+	if err := m.withRetry(ctx, func() error {
 		return client.Connect()
 	}); err != nil {
 		_ = client.Close(true)
@@ -271,7 +266,7 @@ func (m *Manager) beamChromecast(ctx context.Context, req domain.BeamRequest, de
 		return nil, err
 	}
 
-	if err := m.withRetry(ctx, "chromecast_load", func() error {
+	if err := m.withRetry(ctx, func() error {
 		return client.Load(playback.mediaURL, playback.mediaType, 0, playback.mediaDuration, playback.subtitleURL, playback.live)
 	}); err != nil {
 		cleanupPrepared(playback)
@@ -531,7 +526,7 @@ func (m *Manager) prepareURLPlayback(ctx context.Context, req domain.BeamRequest
 
 	var preparedMedia any
 	var mediaType string
-	err := m.withRetry(ctx, "prepare_url_media", func() error {
+	err := m.withRetry(ctx, func() error {
 		var callErr error
 		preparedMedia, mediaType, callErr = m.prepareURLMedia(ctx, sourceURL)
 		return callErr
@@ -662,7 +657,7 @@ func (m *Manager) prepareDLNAURLPlayback(ctx context.Context, req domain.BeamReq
 
 	var preparedMedia any
 	var mediaType string
-	err = m.withRetry(ctx, "prepare_url_media", func() error {
+	err = m.withRetry(ctx, func() error {
 		var callErr error
 		preparedMedia, mediaType, callErr = m.prepareURLMedia(ctx, sourceURL)
 		return callErr
@@ -729,7 +724,7 @@ func (m *Manager) startDLNAServerAndPlay(
 		payload.SetMediaURL(strings.TrimSpace(overrideMediaURL))
 	}
 
-	if err := m.withRetry(ctx, "dlna_play", func() error {
+	if err := m.withRetry(ctx, func() error {
 		return payload.SendtoTV("Play1")
 	}); err != nil {
 		server.StopServer()
@@ -981,7 +976,7 @@ func (m *Manager) addSubtitleSidecar(server streamServer, listenAddr, subtitlesP
 	}
 }
 
-func (m *Manager) withRetry(ctx context.Context, operation string, call func() error) error {
+func (m *Manager) withRetry(ctx context.Context, call func() error) error {
 	if call == nil {
 		return errors.New("retry call is nil")
 	}
@@ -1011,7 +1006,6 @@ func (m *Manager) withRetry(ctx context.Context, operation string, call func() e
 		}
 
 		backoff := backoffForAttempt(baseBackoff, maxBackoff, attempt)
-		m.safeLogf("retrying operation=%s attempt=%d/%d backoff=%s err=%s", operation, attempt+1, attempts, backoff, err.Error())
 		if waitErr := waitForBackoff(ctx, backoff); waitErr != nil {
 			return waitErr
 		}
@@ -1083,13 +1077,6 @@ func isTransientNetworkError(err error) bool {
 		}
 	}
 	return false
-}
-
-func (m *Manager) safeLogf(format string, args ...any) {
-	if m == nil || m.logf == nil {
-		return
-	}
-	m.logf(format, args...)
 }
 
 func (m *Manager) takeSession(req domain.StopRequest) *session {
@@ -1573,7 +1560,6 @@ func (m *Manager) validateLocalFilePath(pathValue, fieldName string) (string, er
 		return "", pathPolicyBlockedError(fieldName)
 	}
 	if !m.pathAllowed(resolved) {
-		m.safeLogf("path policy blocked field=%s path=%s", fieldName, m.logPath(resolved))
 		return "", pathPolicyBlockedError(fieldName)
 	}
 	return filepath.Clean(resolved), nil
@@ -1635,16 +1621,6 @@ func (m *Manager) validateBindAddress(listenAddr string) error {
 		return bindPolicyBlockedError(listenAddr)
 	}
 	return nil
-}
-
-func (m *Manager) logPath(pathValue string) string {
-	if !m.redactPaths {
-		return pathValue
-	}
-	if filepath.IsAbs(pathValue) {
-		return "<redacted-path>"
-	}
-	return pathValue
 }
 
 func normalizeTranscodeMode(mode string) string {
