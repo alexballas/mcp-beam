@@ -19,11 +19,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/alex/mcp-beam/internal/adapters"
-	"github.com/alex/mcp-beam/internal/domain"
 	"go2tv.app/go2tv/v2/httphandlers"
 	"go2tv.app/go2tv/v2/soapcalls"
 	"go2tv.app/go2tv/v2/utils"
+	"go2tv.app/mcp-beam/internal/adapters"
+	"go2tv.app/mcp-beam/internal/domain"
 )
 
 const (

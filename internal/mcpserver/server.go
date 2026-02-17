@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/alex/mcp-beam/internal/domain"
+	"go2tv.app/mcp-beam/internal/domain"
 )
 
 const protocolVersion = "2024-11-05"

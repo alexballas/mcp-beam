@@ -1,8 +1,8 @@
-module github.com/alex/mcp-beam
+module go2tv.app/mcp-beam
 
 go 1.25
 
-require go2tv.app/go2tv/v2 v2.0.0
+require go2tv.app/go2tv/v2 v2.1.0
 
 require (
 	github.com/alexballas/go-ssdp v0.0.3 // indirect
@@ -29,5 +29,3 @@ require (
 	golang.org/x/tools v0.41.0 // indirect
 	gopkg.in/ini.v1 v1.67.1 // indirect
 )
-
-replace go2tv.app/go2tv/v2 => ../go2tv

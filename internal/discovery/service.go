@@ -14,9 +14,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/alex/mcp-beam/internal/adapters"
-	"github.com/alex/mcp-beam/internal/domain"
 	"go2tv.app/go2tv/v2/devices"
+	"go2tv.app/mcp-beam/internal/adapters"
+	"go2tv.app/mcp-beam/internal/domain"
 )
 
 const (

@@ -12,13 +12,13 @@ import (
 	"strings"
 	"time"
 
-	go2tvadapters "github.com/alex/mcp-beam/internal/adapters/go2tv"
-	"github.com/alex/mcp-beam/internal/beam"
-	"github.com/alex/mcp-beam/internal/buildinfo"
-	"github.com/alex/mcp-beam/internal/diagnostics"
-	"github.com/alex/mcp-beam/internal/discovery"
-	"github.com/alex/mcp-beam/internal/lifecycle"
-	"github.com/alex/mcp-beam/internal/mcpserver"
+	go2tvadapters "go2tv.app/mcp-beam/internal/adapters/go2tv"
+	"go2tv.app/mcp-beam/internal/beam"
+	"go2tv.app/mcp-beam/internal/buildinfo"
+	"go2tv.app/mcp-beam/internal/diagnostics"
+	"go2tv.app/mcp-beam/internal/discovery"
+	"go2tv.app/mcp-beam/internal/lifecycle"
+	"go2tv.app/mcp-beam/internal/mcpserver"
 )
 
 type selfTestOutput struct {

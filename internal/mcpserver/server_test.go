@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/alex/mcp-beam/internal/domain"
+	"go2tv.app/mcp-beam/internal/domain"
 )
 
 type fakeLocalHardwareLister struct {

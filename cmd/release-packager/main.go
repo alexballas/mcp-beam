@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/alex/mcp-beam/internal/buildinfo"
-	"github.com/alex/mcp-beam/internal/release"
+	"go2tv.app/mcp-beam/internal/buildinfo"
+	"go2tv.app/mcp-beam/internal/release"
 )
 
 func main() {

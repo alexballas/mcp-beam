@@ -65,6 +65,8 @@ github.com/vishen/go-chromecast v0.3.4/go.mod h1:9ht6970KP5YmO0WpJJPMfInai2HA5w+
 github.com/yuin/goldmark v1.1.27/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9decYSb74=
 github.com/yuin/goldmark v1.2.1/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9decYSb74=
 github.com/yuin/goldmark v1.4.13/go.mod h1:6yULJ656Px+3vBD8DxQVa3kxgyrAnzto9xy5taEt/CY=
+go2tv.app/go2tv/v2 v2.1.0 h1:n3Mv+nMilxbPDccSkv6Xgp/LcE+nEn4a8xzXLCfVaoo=
+go2tv.app/go2tv/v2 v2.1.0/go.mod h1:pfcZHQwyh0VipuFUVpAXEr1u7x2EscQAjVUyTd8+G4M=
 golang.org/x/crypto v0.0.0-20190308221718-c2843e01d9a2/go.mod h1:djNgcEr1/C05ACkg1iLfiJU5Ep61QUkGW8qpdssI0+w=
 golang.org/x/crypto v0.0.0-20191011191535-87dc89f01550/go.mod h1:yigFU9vqHzYiE8UmvKecakEJjdnWj3jj499lnFckfCI=
 golang.org/x/crypto v0.0.0-20200622213623-75b288015ac9/go.mod h1:LzIPMQfyMNhhGPhUkYOs5KpL4U8rLKemX1yGLhDgUto=
