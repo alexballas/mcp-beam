@@ -1,0 +1,20 @@
+{
+  "name": "cursor_extra_top_level_with_arguments",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 9003,
+    "method": "tools/call",
+    "params": {
+      "name": "list_local_hardware",
+      "client_build": "cursor-nightly",
+      "arguments": {
+        "timeout_ms": 5300,
+        "include_unreachable": false
+      }
+    }
+  },
+  "expect": {
+    "timeout_ms": 5300,
+    "include_unreachable": false
+  }
+}

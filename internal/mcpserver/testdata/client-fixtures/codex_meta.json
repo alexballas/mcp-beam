@@ -1,0 +1,22 @@
+{
+  "name": "codex_meta_arguments",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 9001,
+    "method": "tools/call",
+    "params": {
+      "name": "list_local_hardware",
+      "_meta": {
+        "progressToken": "tok_codex"
+      },
+      "arguments": {
+        "timeout_ms": 5100,
+        "include_unreachable": true
+      }
+    }
+  },
+  "expect": {
+    "timeout_ms": 5100,
+    "include_unreachable": true
+  }
+}

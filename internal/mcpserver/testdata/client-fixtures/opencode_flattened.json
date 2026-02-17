@@ -1,0 +1,17 @@
+{
+  "name": "opencode_flattened_arguments",
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 9002,
+    "method": "tools/call",
+    "params": {
+      "name": "list_local_hardware",
+      "timeout_ms": 5200,
+      "include_unreachable": true
+    }
+  },
+  "expect": {
+    "timeout_ms": 5200,
+    "include_unreachable": true
+  }
+}
