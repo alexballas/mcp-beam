@@ -2,10 +2,14 @@
 
 ![mcp-beam app icon](./mcp-beam.png)
 
-![CI](https://github.com/alex/mcp-beam/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/alexballas/mcp-beam/actions/workflows/ci.yml/badge.svg)
 ![Go 1.25+](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go)
 
-`mcp-beam` is a production-ready MCP server (`stdio` transport) for casting local files and media URLs to Chromecast and DLNA/UPnP devices on your LAN.
+## Demo
+
+![mcp-beam demo](./assets/demo.png)
+
+`mcp-beam` is a MCP server (`stdio` transport) for casting local files and media URLs to Chromecast and DLNA/UPnP devices on your LAN.
 
 It exposes three tools:
 - `list_local_hardware`
@@ -22,9 +26,11 @@ It exposes three tools:
 
 ## Table of Contents
 
+- [Demo](#demo)
 - [Quick Start](#quick-start)
 - [Installation](#installation)
 - [Runtime Dependencies](#runtime-dependencies)
+  - [Go Installation](#go-installation)
 - [Tool Reference](#tool-reference)
 - [Transcode Behavior](#transcode-behavior)
 - [Error Model](#error-model)
@@ -224,8 +230,39 @@ MCP config for a local binary:
 
 ## Runtime Dependencies
 
+- `go` (Go 1.25+) is required to run the server. See [Go Installation](#go-installation) below.
 - `ffmpeg` and `ffprobe` are optional for non-transcoding paths, but recommended.
-- If transcoding is required and `ffmpeg` is unavailable, calls return `FFMPEG_NOT_FOUND`.
+  - If transcoding is required and `ffmpeg` is unavailable, calls return `FFMPEG_NOT_FOUND`.
+
+### Go Installation
+
+#### Linux
+
+Download and install from https://go.dev/dl/ or via package manager:
+
+- Debian/Ubuntu: `sudo apt install golang-go`
+- Fedora: `sudo dnf install golang`
+- Arch: `sudo pacman -S go`
+
+#### macOS
+
+Download and install from https://go.dev/dl/ or use Homebrew:
+
+```bash
+brew install go@1.25
+```
+
+#### Windows
+
+Download and install from https://go.dev/dl/
+
+#### Verify Installation
+
+```bash
+go version
+```
+
+Should output: `go1.25.0` or higher.
 
 Install examples:
 - Linux: package manager (for example `sudo apt install ffmpeg`)
