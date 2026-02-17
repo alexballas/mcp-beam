@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -154,6 +156,32 @@ func TestUnknownMethod(t *testing.T) {
 	}
 }
 
+func TestInvalidRequestJSONRPCVersion(t *testing.T) {
+	input := bytes.NewBuffer(nil)
+	output := bytes.NewBuffer(nil)
+
+	writeRequest(t, input, map[string]any{
+		"jsonrpc": "1.0",
+		"id":      "badver",
+		"method":  "tools/list",
+	})
+
+	srv := New(input, output, Config{})
+	if err := srv.Run(context.Background()); err != nil {
+		t.Fatalf("run server: %v", err)
+	}
+
+	responses := readResponses(t, output.Bytes())
+	if len(responses) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(responses))
+	}
+
+	errObj := responses[0]["error"].(map[string]any)
+	if errObj["code"].(float64) != -32600 {
+		t.Fatalf("expected -32600, got %v", errObj["code"])
+	}
+}
+
 func TestToolsCallListLocalHardware(t *testing.T) {
 	input := bytes.NewBuffer(nil)
 	output := bytes.NewBuffer(nil)
@@ -202,6 +230,159 @@ func TestToolsCallListLocalHardware(t *testing.T) {
 	}
 	if !lister.includeUnreachable {
 		t.Fatal("expected include_unreachable=true to be forwarded")
+	}
+}
+
+func TestToolsCallListLocalHardwareAllowsMetaField(t *testing.T) {
+	input := bytes.NewBuffer(nil)
+	output := bytes.NewBuffer(nil)
+	lister := &fakeLocalHardwareLister{
+		devices: []domain.Device{
+			{ID: "dev_a", Name: "Bedroom TV", Protocol: "dlna"},
+		},
+	}
+
+	writeRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      30,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name": "list_local_hardware",
+			"_meta": map[string]any{
+				"progressToken": "tok_1",
+			},
+			"arguments": map[string]any{
+				"timeout_ms":          3100,
+				"include_unreachable": true,
+			},
+		},
+	})
+
+	srv := New(input, output, Config{LocalHardwareLister: lister})
+	if err := srv.Run(context.Background()); err != nil {
+		t.Fatalf("run server: %v", err)
+	}
+
+	responses := readResponses(t, output.Bytes())
+	if len(responses) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(responses))
+	}
+	if responses[0]["error"] != nil {
+		t.Fatalf("expected successful tools/call, got error: %#v", responses[0]["error"])
+	}
+	if lister.timeoutMS != 3100 {
+		t.Fatalf("expected timeout 3100, got %d", lister.timeoutMS)
+	}
+	if !lister.includeUnreachable {
+		t.Fatal("expected include_unreachable=true to be forwarded")
+	}
+}
+
+func TestToolsCallListLocalHardwareSupportsFlattenedArguments(t *testing.T) {
+	input := bytes.NewBuffer(nil)
+	output := bytes.NewBuffer(nil)
+	lister := &fakeLocalHardwareLister{
+		devices: []domain.Device{
+			{ID: "dev_a", Name: "Bedroom TV", Protocol: "dlna"},
+		},
+	}
+
+	writeRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      31,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name":                "list_local_hardware",
+			"timeout_ms":          3200,
+			"include_unreachable": true,
+		},
+	})
+
+	srv := New(input, output, Config{LocalHardwareLister: lister})
+	if err := srv.Run(context.Background()); err != nil {
+		t.Fatalf("run server: %v", err)
+	}
+
+	responses := readResponses(t, output.Bytes())
+	if len(responses) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(responses))
+	}
+	if responses[0]["error"] != nil {
+		t.Fatalf("expected successful tools/call, got error: %#v", responses[0]["error"])
+	}
+	if lister.timeoutMS != 3200 {
+		t.Fatalf("expected timeout 3200, got %d", lister.timeoutMS)
+	}
+	if !lister.includeUnreachable {
+		t.Fatal("expected include_unreachable=true to be forwarded")
+	}
+}
+
+func TestToolsCallListLocalHardwareClientFixtureMatrix(t *testing.T) {
+	type fixture struct {
+		Name    string         `json:"name"`
+		Request map[string]any `json:"request"`
+		Expect  struct {
+			TimeoutMS          int  `json:"timeout_ms"`
+			IncludeUnreachable bool `json:"include_unreachable"`
+		} `json:"expect"`
+	}
+
+	entries, err := os.ReadDir("testdata/client-fixtures")
+	if err != nil {
+		t.Fatalf("read fixture dir: %v", err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("expected at least one client fixture")
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+
+		path := filepath.Join("testdata/client-fixtures", entry.Name())
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read fixture %s: %v", path, err)
+		}
+
+		var f fixture
+		if err := json.Unmarshal(raw, &f); err != nil {
+			t.Fatalf("unmarshal fixture %s: %v", path, err)
+		}
+
+		t.Run(f.Name, func(t *testing.T) {
+			input := bytes.NewBuffer(nil)
+			output := bytes.NewBuffer(nil)
+			lister := &fakeLocalHardwareLister{
+				devices: []domain.Device{
+					{ID: "dev_a", Name: "Living Room TV", Protocol: "chromecast"},
+				},
+			}
+
+			writeRequest(t, input, f.Request)
+
+			srv := New(input, output, Config{LocalHardwareLister: lister})
+			if err := srv.Run(context.Background()); err != nil {
+				t.Fatalf("run server: %v", err)
+			}
+
+			responses := readResponses(t, output.Bytes())
+			if len(responses) != 1 {
+				t.Fatalf("expected 1 response, got %d", len(responses))
+			}
+			if responses[0]["error"] != nil {
+				t.Fatalf("expected successful tools/call, got error: %#v", responses[0]["error"])
+			}
+
+			if lister.timeoutMS != f.Expect.TimeoutMS {
+				t.Fatalf("expected timeout %d, got %d", f.Expect.TimeoutMS, lister.timeoutMS)
+			}
+			if lister.includeUnreachable != f.Expect.IncludeUnreachable {
+				t.Fatalf("expected include_unreachable=%t, got %t", f.Expect.IncludeUnreachable, lister.includeUnreachable)
+			}
+		})
 	}
 }
 

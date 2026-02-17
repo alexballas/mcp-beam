@@ -17,7 +17,7 @@ import (
 
 const protocolVersion = "2024-11-05"
 const (
-	defaultDiscoveryTimeoutMS = 2500
+	defaultDiscoveryTimeoutMS = 5000
 	minDiscoveryTimeoutMS     = 100
 	transcodeAuto             = "auto"
 	transcodeAlways           = "always"
@@ -179,8 +179,8 @@ func (s *Server) handle(ctx context.Context, payload []byte) error {
 func (s *Server) handleToolCall(ctx context.Context, id json.RawMessage, rawParams json.RawMessage) error {
 	startedAt := time.Now()
 
-	var params toolsCallParams
-	if err := decodeStrict(rawParams, &params); err != nil {
+	params, err := decodeToolCallParams(rawParams)
+	if err != nil {
 		return s.sendInvalidParams("tools/call", "", "", startedAt, id)
 	}
 
@@ -202,6 +202,54 @@ func (s *Server) handleToolCall(ctx context.Context, id json.RawMessage, rawPara
 			),
 		})
 	}
+}
+
+func decodeToolCallParams(raw json.RawMessage) (toolsCallParams, error) {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return toolsCallParams{}, err
+	}
+
+	nameRaw, ok := payload["name"]
+	if !ok {
+		return toolsCallParams{}, fmt.Errorf("missing tool name")
+	}
+
+	var name string
+	if err := json.Unmarshal(nameRaw, &name); err != nil {
+		return toolsCallParams{}, err
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return toolsCallParams{}, fmt.Errorf("missing tool name")
+	}
+
+	arguments, ok := payload["arguments"]
+	if !ok {
+		flattened := map[string]json.RawMessage{}
+		for key, value := range payload {
+			if key == "name" || key == "_meta" {
+				continue
+			}
+			flattened[key] = value
+		}
+		if len(flattened) > 0 {
+			normalized, err := json.Marshal(flattened)
+			if err != nil {
+				return toolsCallParams{}, err
+			}
+			arguments = normalized
+		}
+	}
+
+	if len(bytes.TrimSpace(arguments)) == 0 {
+		arguments = json.RawMessage("{}")
+	}
+
+	return toolsCallParams{
+		Name:      name,
+		Arguments: arguments,
+	}, nil
 }
 
 func (s *Server) handleBeamMediaCall(ctx context.Context, id json.RawMessage, rawArgs json.RawMessage) error {
@@ -554,7 +602,7 @@ func staticTools() []tool {
 					"timeout_ms": map[string]any{
 						"type":        "integer",
 						"minimum":     100,
-						"default":     2500,
+						"default":     defaultDiscoveryTimeoutMS,
 						"description": "Discovery timeout in milliseconds.",
 					},
 					"include_unreachable": map[string]any{

@@ -245,7 +245,7 @@ Verify:
 Discover Chromecast and DLNA/UPnP renderers on the local network.
 
 Arguments:
-- `timeout_ms` (optional integer, minimum `100`, default `2500`)
+- `timeout_ms` (optional integer, minimum `100`, default `5000`)
 - `include_unreachable` (optional boolean, default `false`)
 
 Example:
@@ -254,7 +254,7 @@ Example:
 {
   "name": "list_local_hardware",
   "arguments": {
-    "timeout_ms": 2500,
+    "timeout_ms": 5000,
     "include_unreachable": false
   }
 }
