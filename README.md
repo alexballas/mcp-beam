@@ -54,6 +54,9 @@ claude mcp add --scope user mcp-beam -- go run go2tv.app/mcp-beam@latest
 
 # Codex
 codex mcp add mcp-beam -- go run go2tv.app/mcp-beam@latest
+
+# Gemini
+gemini mcp add mcp-beam go run go2tv.app/mcp-beam@latest
 ```
 
 Generic JSON configuration (for MCP hosts using `mcpServers`):
