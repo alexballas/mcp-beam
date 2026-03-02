@@ -30,6 +30,9 @@ type fakeBeamController struct {
 	stopReq    domain.StopRequest
 	stopResult *domain.StopResult
 	stopErr    error
+	seekReq    domain.SeekRequest
+	seekResult *domain.SeekResult
+	seekErr    error
 }
 
 func (f *fakeBeamController) BeamMedia(ctx context.Context, req domain.BeamRequest) (*domain.BeamResult, error) {
@@ -40,6 +43,11 @@ func (f *fakeBeamController) BeamMedia(ctx context.Context, req domain.BeamReque
 func (f *fakeBeamController) StopBeaming(ctx context.Context, req domain.StopRequest) (*domain.StopResult, error) {
 	f.stopReq = req
 	return f.stopResult, f.stopErr
+}
+
+func (f *fakeBeamController) SeekBeaming(ctx context.Context, req domain.SeekRequest) (*domain.SeekResult, error) {
+	f.seekReq = req
+	return f.seekResult, f.seekErr
 }
 
 func (f *fakeLocalHardwareLister) ListLocalHardware(ctx context.Context, timeoutMS int, includeUnreachable bool) ([]domain.Device, error) {
@@ -89,8 +97,8 @@ func TestInitializeAndToolsList(t *testing.T) {
 
 	toolResult := responses[1]["result"].(map[string]any)
 	tools := toolResult["tools"].([]any)
-	if len(tools) != 3 {
-		t.Fatalf("expected 3 tools, got %d", len(tools))
+	if len(tools) != 4 {
+		t.Fatalf("expected 4 tools, got %d", len(tools))
 	}
 }
 
@@ -691,6 +699,285 @@ func TestToolsCallStopBeamingJSONLine(t *testing.T) {
 	structured := result["structuredContent"].(map[string]any)
 	if structured["stopped_session_id"].(string) != "sess_json_stop" {
 		t.Fatalf("unexpected stopped_session_id: %v", structured["stopped_session_id"])
+	}
+}
+
+func TestToolsCallSeekBeaming(t *testing.T) {
+	input := bytes.NewBuffer(nil)
+	output := bytes.NewBuffer(nil)
+	duration := 1800.0
+	controller := &fakeBeamController{
+		seekResult: &domain.SeekResult{
+			OK:                      true,
+			SessionID:               "sess_seek_1",
+			DeviceID:                "dev_1",
+			PositionSeconds:         95,
+			RequestedMode:           "absolute_seconds",
+			ResolvedPositionSeconds: 95,
+			DurationSeconds:         &duration,
+		},
+	}
+
+	writeRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      66,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name": "seek_beaming",
+			"arguments": map[string]any{
+				"session_id":       "sess_seek_1",
+				"position_seconds": 95,
+			},
+		},
+	})
+
+	srv := New(input, output, Config{BeamController: controller})
+	if err := srv.Run(context.Background()); err != nil {
+		t.Fatalf("run server: %v", err)
+	}
+
+	responses := readResponses(t, output.Bytes())
+	if len(responses) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(responses))
+	}
+	result := responses[0]["result"].(map[string]any)
+	structured := result["structuredContent"].(map[string]any)
+	if structured["session_id"].(string) != "sess_seek_1" {
+		t.Fatalf("unexpected session_id: %v", structured["session_id"])
+	}
+	if int(structured["position_seconds"].(float64)) != 95 {
+		t.Fatalf("unexpected position_seconds: %v", structured["position_seconds"])
+	}
+	if controller.seekReq.SessionID != "sess_seek_1" {
+		t.Fatalf("unexpected seek request session: %s", controller.seekReq.SessionID)
+	}
+	if controller.seekReq.PositionSeconds == nil || *controller.seekReq.PositionSeconds != 95 {
+		t.Fatalf("unexpected seek request position: %#v", controller.seekReq.PositionSeconds)
+	}
+	if structured["requested_mode"].(string) != "absolute_seconds" {
+		t.Fatalf("unexpected requested_mode: %v", structured["requested_mode"])
+	}
+	if int(structured["resolved_position_seconds"].(float64)) != 95 {
+		t.Fatalf("unexpected resolved_position_seconds: %v", structured["resolved_position_seconds"])
+	}
+	if int(structured["duration_seconds"].(float64)) != 1800 {
+		t.Fatalf("unexpected duration_seconds: %v", structured["duration_seconds"])
+	}
+}
+
+func TestToolsCallSeekBeamingInvalidParams(t *testing.T) {
+	input := bytes.NewBuffer(nil)
+	output := bytes.NewBuffer(nil)
+
+	writeRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      67,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name": "seek_beaming",
+			"arguments": map[string]any{
+				"position_seconds": -1,
+			},
+		},
+	})
+
+	srv := New(input, output, Config{BeamController: &fakeBeamController{}})
+	if err := srv.Run(context.Background()); err != nil {
+		t.Fatalf("run server: %v", err)
+	}
+
+	responses := readResponses(t, output.Bytes())
+	if len(responses) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(responses))
+	}
+
+	errObj := responses[0]["error"].(map[string]any)
+	if errObj["code"].(float64) != -32602 {
+		t.Fatalf("expected -32602, got %v", errObj["code"])
+	}
+}
+
+func TestToolsCallSeekBeamingPercent(t *testing.T) {
+	input := bytes.NewBuffer(nil)
+	output := bytes.NewBuffer(nil)
+	controller := &fakeBeamController{
+		seekResult: &domain.SeekResult{
+			OK:                      true,
+			SessionID:               "sess_seek_pct",
+			DeviceID:                "dev_1",
+			PositionSeconds:         50,
+			RequestedMode:           "percent",
+			ResolvedPositionSeconds: 50,
+		},
+	}
+
+	writeRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      68,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name": "seek_beaming",
+			"arguments": map[string]any{
+				"target_device":    "dev_1",
+				"position_percent": 25.0,
+			},
+		},
+	})
+
+	srv := New(input, output, Config{BeamController: controller})
+	if err := srv.Run(context.Background()); err != nil {
+		t.Fatalf("run server: %v", err)
+	}
+
+	responses := readResponses(t, output.Bytes())
+	if len(responses) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(responses))
+	}
+	if controller.seekReq.PositionPercent == nil || *controller.seekReq.PositionPercent != 25 {
+		t.Fatalf("unexpected seek request percent: %#v", controller.seekReq.PositionPercent)
+	}
+	if controller.seekReq.PositionSeconds != nil {
+		t.Fatalf("expected no absolute seek value, got %#v", controller.seekReq.PositionSeconds)
+	}
+}
+
+func TestToolsCallSeekBeamingFromEnd(t *testing.T) {
+	input := bytes.NewBuffer(nil)
+	output := bytes.NewBuffer(nil)
+	controller := &fakeBeamController{
+		seekResult: &domain.SeekResult{
+			OK:                      true,
+			SessionID:               "sess_seek_end",
+			DeviceID:                "dev_1",
+			PositionSeconds:         110,
+			RequestedMode:           "from_end_seconds",
+			ResolvedPositionSeconds: 110,
+		},
+	}
+
+	writeRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      69,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name": "seek_beaming",
+			"arguments": map[string]any{
+				"session_id":       "sess_seek_end",
+				"from_end_seconds": 10,
+			},
+		},
+	})
+
+	srv := New(input, output, Config{BeamController: controller})
+	if err := srv.Run(context.Background()); err != nil {
+		t.Fatalf("run server: %v", err)
+	}
+
+	responses := readResponses(t, output.Bytes())
+	if len(responses) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(responses))
+	}
+	if controller.seekReq.FromEndSeconds == nil || *controller.seekReq.FromEndSeconds != 10 {
+		t.Fatalf("unexpected seek request from_end_seconds: %#v", controller.seekReq.FromEndSeconds)
+	}
+	if controller.seekReq.PositionSeconds != nil || controller.seekReq.PositionPercent != nil {
+		t.Fatalf("expected only from_end seek mode, got %+v", controller.seekReq)
+	}
+}
+
+func TestToolsCallSeekBeamingInvalidParamsMissingMode(t *testing.T) {
+	input := bytes.NewBuffer(nil)
+	output := bytes.NewBuffer(nil)
+
+	writeRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      70,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name": "seek_beaming",
+			"arguments": map[string]any{
+				"session_id": "sess_seek_1",
+			},
+		},
+	})
+
+	srv := New(input, output, Config{BeamController: &fakeBeamController{}})
+	if err := srv.Run(context.Background()); err != nil {
+		t.Fatalf("run server: %v", err)
+	}
+
+	responses := readResponses(t, output.Bytes())
+	if len(responses) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(responses))
+	}
+	errObj := responses[0]["error"].(map[string]any)
+	if errObj["code"].(float64) != -32602 {
+		t.Fatalf("expected -32602, got %v", errObj["code"])
+	}
+}
+
+func TestToolsCallSeekBeamingInvalidParamsMultipleModes(t *testing.T) {
+	input := bytes.NewBuffer(nil)
+	output := bytes.NewBuffer(nil)
+
+	writeRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      71,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name": "seek_beaming",
+			"arguments": map[string]any{
+				"session_id":       "sess_seek_1",
+				"position_seconds": 15,
+				"position_percent": 10,
+			},
+		},
+	})
+
+	srv := New(input, output, Config{BeamController: &fakeBeamController{}})
+	if err := srv.Run(context.Background()); err != nil {
+		t.Fatalf("run server: %v", err)
+	}
+
+	responses := readResponses(t, output.Bytes())
+	if len(responses) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(responses))
+	}
+	errObj := responses[0]["error"].(map[string]any)
+	if errObj["code"].(float64) != -32602 {
+		t.Fatalf("expected -32602, got %v", errObj["code"])
+	}
+}
+
+func TestToolsCallSeekBeamingInvalidParamsPercentOutOfRange(t *testing.T) {
+	input := bytes.NewBuffer(nil)
+	output := bytes.NewBuffer(nil)
+
+	writeRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      72,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name": "seek_beaming",
+			"arguments": map[string]any{
+				"session_id":       "sess_seek_1",
+				"position_percent": 140,
+			},
+		},
+	})
+
+	srv := New(input, output, Config{BeamController: &fakeBeamController{}})
+	if err := srv.Run(context.Background()); err != nil {
+		t.Fatalf("run server: %v", err)
+	}
+
+	responses := readResponses(t, output.Bytes())
+	if len(responses) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(responses))
+	}
+	errObj := responses[0]["error"].(map[string]any)
+	if errObj["code"].(float64) != -32602 {
+		t.Fatalf("expected -32602, got %v", errObj["code"])
 	}
 }
 

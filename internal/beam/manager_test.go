@@ -99,6 +99,7 @@ type fakeCastClient struct {
 	connectErrs  []error
 	loadErr      error
 	loadErrs     []error
+	seekErr      error
 	stopErr      error
 	closeErr     error
 	statusErr    error
@@ -107,8 +108,10 @@ type fakeCastClient struct {
 	loadType     string
 	loadLive     bool
 	loadSubtitle string
+	seekSeconds  int
 	connectCalls int
 	loadCalls    int
+	seekCalls    int
 	stopCalls    int
 	closeCalls   int
 	statusCalls  int
@@ -151,6 +154,12 @@ func (f *fakeCastClient) Load(mediaURL, contentType string, startTime int, durat
 func (f *fakeCastClient) Stop() error {
 	f.stopCalls++
 	return f.stopErr
+}
+
+func (f *fakeCastClient) Seek(seconds int) error {
+	f.seekCalls++
+	f.seekSeconds = seconds
+	return f.seekErr
 }
 
 func (f *fakeCastClient) GetStatus() (*castprotocol.CastStatus, error) {
@@ -223,6 +232,8 @@ type fakeDLNAPayload struct {
 	transportErr       error
 	positionResponse   []string
 	positionErr        error
+	seekErr            error
+	seekRelTime        string
 
 	setContextCalls int
 }
@@ -263,6 +274,13 @@ func (f *fakeDLNAPayload) GetPositionInfo() ([]string, error) {
 		return append([]string{}, f.positionResponse...), nil
 	}
 	return []string{"00:30:00", "00:00:02"}, nil
+}
+
+func (f *fakeDLNAPayload) SeekSoapCall(reltime string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.seekRelTime = reltime
+	return f.seekErr
 }
 
 func (f *fakeDLNAPayload) ListenAddress() string {
@@ -417,6 +435,341 @@ func TestBeamMediaFileAndStop(t *testing.T) {
 	}
 	if len(serverFactory.servers) == 0 || !serverFactory.servers[0].stopCalled {
 		t.Fatal("expected media server to be stopped")
+	}
+}
+
+func TestSeekBeamingChromecastBySessionID(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	defer manager.Close(context.Background())
+
+	castClient := &fakeCastClient{}
+	sess := &session{
+		ID:         "sess_seek_cast",
+		DeviceID:   "dev_cast",
+		DeviceName: "Living Room",
+		Protocol:   "chromecast",
+		castClient: castClient,
+	}
+	manager.initializeSessionLifecycle(sess, "playing", "10")
+	if _, stored := manager.storeSession(sess); !stored {
+		t.Fatal("expected session to be stored")
+	}
+
+	seekPosition := 95
+	result, err := manager.SeekBeaming(context.Background(), domain.SeekRequest{
+		SessionID:       "sess_seek_cast",
+		PositionSeconds: &seekPosition,
+	})
+	if err != nil {
+		t.Fatalf("seek beaming: %v", err)
+	}
+	if !result.OK {
+		t.Fatal("expected seek OK=true")
+	}
+	if result.SessionID != "sess_seek_cast" {
+		t.Fatalf("unexpected session id: %s", result.SessionID)
+	}
+	if result.DeviceID != "dev_cast" {
+		t.Fatalf("unexpected device id: %s", result.DeviceID)
+	}
+	if castClient.seekCalls != 1 {
+		t.Fatalf("expected one seek call, got %d", castClient.seekCalls)
+	}
+	if castClient.seekSeconds != 95 {
+		t.Fatalf("expected seek position 95, got %d", castClient.seekSeconds)
+	}
+	if result.RequestedMode != "absolute_seconds" {
+		t.Fatalf("expected absolute_seconds, got %s", result.RequestedMode)
+	}
+	if result.ResolvedPositionSeconds != 95 {
+		t.Fatalf("expected resolved_position_seconds=95, got %d", result.ResolvedPositionSeconds)
+	}
+	if result.DurationSeconds != nil {
+		t.Fatalf("expected no duration for absolute seek, got %v", *result.DurationSeconds)
+	}
+}
+
+func TestSeekBeamingDLNAByTargetDevice(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	defer manager.Close(context.Background())
+
+	dlnaPayload := &fakeDLNAPayload{listenAddr: "127.0.0.1:3511"}
+	sess := &session{
+		ID:          "sess_seek_dlna",
+		DeviceID:    "dev_dlna",
+		DeviceName:  "Bedroom TV",
+		Protocol:    "dlna",
+		dlnaPayload: dlnaPayload,
+	}
+	manager.initializeSessionLifecycle(sess, "playing", "00:00:10")
+	if _, stored := manager.storeSession(sess); !stored {
+		t.Fatal("expected session to be stored")
+	}
+
+	seekPosition := 90
+	result, err := manager.SeekBeaming(context.Background(), domain.SeekRequest{
+		TargetDevice:    "Bedroom TV",
+		PositionSeconds: &seekPosition,
+	})
+	if err != nil {
+		t.Fatalf("seek beaming: %v", err)
+	}
+	if !result.OK {
+		t.Fatal("expected seek OK=true")
+	}
+	if dlnaPayload.seekRelTime != "00:01:30" {
+		t.Fatalf("expected DLNA reltime 00:01:30, got %s", dlnaPayload.seekRelTime)
+	}
+	if result.RequestedMode != "absolute_seconds" {
+		t.Fatalf("expected absolute_seconds, got %s", result.RequestedMode)
+	}
+}
+
+func TestSeekBeamingRequiresTarget(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	defer manager.Close(context.Background())
+
+	seekPosition := 30
+	_, err := manager.SeekBeaming(context.Background(), domain.SeekRequest{
+		PositionSeconds: &seekPosition,
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	toolErr, ok := err.(*domain.ToolError)
+	if !ok {
+		t.Fatalf("expected ToolError, got %T", err)
+	}
+	if toolErr.Code != "INTERNAL_ERROR" {
+		t.Fatalf("expected INTERNAL_ERROR, got %s", toolErr.Code)
+	}
+}
+
+func TestSeekBeamingChromecastByPercent(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	defer manager.Close(context.Background())
+
+	castClient := &fakeCastClient{
+		statuses: []castprotocol.CastStatus{
+			{PlayerState: "PLAYING", CurrentTime: 10, Duration: 200},
+		},
+	}
+	sess := &session{
+		ID:         "sess_seek_pct",
+		DeviceID:   "dev_cast",
+		DeviceName: "Living Room",
+		Protocol:   "chromecast",
+		castClient: castClient,
+	}
+	manager.initializeSessionLifecycle(sess, "playing", "10")
+	if _, stored := manager.storeSession(sess); !stored {
+		t.Fatal("expected session to be stored")
+	}
+
+	percent := 50.0
+	result, err := manager.SeekBeaming(context.Background(), domain.SeekRequest{
+		SessionID:       "sess_seek_pct",
+		PositionPercent: &percent,
+	})
+	if err != nil {
+		t.Fatalf("seek beaming: %v", err)
+	}
+	if castClient.seekSeconds != 100 {
+		t.Fatalf("expected seek position 100, got %d", castClient.seekSeconds)
+	}
+	if result.RequestedMode != "percent" {
+		t.Fatalf("expected requested_mode percent, got %s", result.RequestedMode)
+	}
+	if result.ResolvedPositionSeconds != 100 {
+		t.Fatalf("expected resolved_position_seconds 100, got %d", result.ResolvedPositionSeconds)
+	}
+	if result.DurationSeconds == nil || *result.DurationSeconds != 200 {
+		t.Fatalf("expected duration_seconds 200, got %#v", result.DurationSeconds)
+	}
+}
+
+func TestSeekBeamingDLNAFromEnd(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	defer manager.Close(context.Background())
+
+	dlnaPayload := &fakeDLNAPayload{
+		listenAddr:         "127.0.0.1:3511",
+		positionResponse:   []string{"00:03:00", "00:00:10"},
+		transportResponses: [][]string{{"PLAYING", "OK", "1"}},
+	}
+	sess := &session{
+		ID:          "sess_seek_end",
+		DeviceID:    "dev_dlna",
+		DeviceName:  "Bedroom TV",
+		Protocol:    "dlna",
+		dlnaPayload: dlnaPayload,
+	}
+	manager.initializeSessionLifecycle(sess, "playing", "00:00:10")
+	if _, stored := manager.storeSession(sess); !stored {
+		t.Fatal("expected session to be stored")
+	}
+
+	fromEnd := 10
+	result, err := manager.SeekBeaming(context.Background(), domain.SeekRequest{
+		TargetDevice:   "Bedroom TV",
+		FromEndSeconds: &fromEnd,
+	})
+	if err != nil {
+		t.Fatalf("seek beaming: %v", err)
+	}
+	if dlnaPayload.seekRelTime != "00:02:50" {
+		t.Fatalf("expected DLNA reltime 00:02:50, got %s", dlnaPayload.seekRelTime)
+	}
+	if result.RequestedMode != "from_end_seconds" {
+		t.Fatalf("expected requested_mode from_end_seconds, got %s", result.RequestedMode)
+	}
+	if result.ResolvedPositionSeconds != 170 {
+		t.Fatalf("expected resolved_position_seconds 170, got %d", result.ResolvedPositionSeconds)
+	}
+	if result.DurationSeconds == nil || *result.DurationSeconds != 180 {
+		t.Fatalf("expected duration_seconds 180, got %#v", result.DurationSeconds)
+	}
+}
+
+func TestSeekBeamingRelativeFailsWhenDurationUnknown(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	defer manager.Close(context.Background())
+
+	castClient := &fakeCastClient{
+		statuses: []castprotocol.CastStatus{
+			{PlayerState: "PLAYING", CurrentTime: 10, Duration: 0},
+		},
+	}
+	sess := &session{
+		ID:         "sess_seek_unknown",
+		DeviceID:   "dev_cast",
+		DeviceName: "Living Room",
+		Protocol:   "chromecast",
+		castClient: castClient,
+	}
+	manager.initializeSessionLifecycle(sess, "playing", "10")
+	if _, stored := manager.storeSession(sess); !stored {
+		t.Fatal("expected session to be stored")
+	}
+
+	percent := 50.0
+	_, err := manager.SeekBeaming(context.Background(), domain.SeekRequest{
+		SessionID:       "sess_seek_unknown",
+		PositionPercent: &percent,
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	toolErr, ok := err.(*domain.ToolError)
+	if !ok {
+		t.Fatalf("expected ToolError, got %T", err)
+	}
+	if toolErr.Code != "SEEK_DURATION_UNKNOWN" {
+		t.Fatalf("expected SEEK_DURATION_UNKNOWN, got %s", toolErr.Code)
+	}
+}
+
+func TestSeekBeamingRequiresExactlyOneMode(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	defer manager.Close(context.Background())
+
+	castClient := &fakeCastClient{}
+	sess := &session{
+		ID:         "sess_seek_mode",
+		DeviceID:   "dev_cast",
+		DeviceName: "Living Room",
+		Protocol:   "chromecast",
+		castClient: castClient,
+	}
+	manager.initializeSessionLifecycle(sess, "playing", "10")
+	if _, stored := manager.storeSession(sess); !stored {
+		t.Fatal("expected session to be stored")
+	}
+
+	_, err := manager.SeekBeaming(context.Background(), domain.SeekRequest{
+		SessionID: "sess_seek_mode",
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if toolErr, ok := err.(*domain.ToolError); !ok || toolErr.Code != "SEEK_MODE_INVALID" {
+		t.Fatalf("expected SEEK_MODE_INVALID, got %#v", err)
+	}
+
+	seekPos := 10
+	percent := 50.0
+	_, err = manager.SeekBeaming(context.Background(), domain.SeekRequest{
+		SessionID:       "sess_seek_mode",
+		PositionSeconds: &seekPos,
+		PositionPercent: &percent,
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if toolErr, ok := err.(*domain.ToolError); !ok || toolErr.Code != "SEEK_MODE_INVALID" {
+		t.Fatalf("expected SEEK_MODE_INVALID, got %#v", err)
+	}
+}
+
+func TestSeekBeamingRelativeEdgeBounds(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	defer manager.Close(context.Background())
+
+	castClient := &fakeCastClient{
+		statuses: []castprotocol.CastStatus{
+			{PlayerState: "PLAYING", CurrentTime: 0, Duration: 200},
+			{PlayerState: "PLAYING", CurrentTime: 0, Duration: 200},
+			{PlayerState: "PLAYING", CurrentTime: 0, Duration: 200},
+		},
+	}
+	sess := &session{
+		ID:         "sess_seek_bounds",
+		DeviceID:   "dev_cast",
+		DeviceName: "Living Room",
+		Protocol:   "chromecast",
+		castClient: castClient,
+	}
+	manager.initializeSessionLifecycle(sess, "playing", "0")
+	if _, stored := manager.storeSession(sess); !stored {
+		t.Fatal("expected session to be stored")
+	}
+
+	zero := 0.0
+	resultZero, err := manager.SeekBeaming(context.Background(), domain.SeekRequest{
+		SessionID:       "sess_seek_bounds",
+		PositionPercent: &zero,
+	})
+	if err != nil {
+		t.Fatalf("seek 0%%: %v", err)
+	}
+	if resultZero.ResolvedPositionSeconds != 0 {
+		t.Fatalf("expected 0%% to resolve to 0, got %d", resultZero.ResolvedPositionSeconds)
+	}
+
+	hundred := 100.0
+	resultHundred, err := manager.SeekBeaming(context.Background(), domain.SeekRequest{
+		SessionID:       "sess_seek_bounds",
+		PositionPercent: &hundred,
+	})
+	if err != nil {
+		t.Fatalf("seek 100%%: %v", err)
+	}
+	if resultHundred.ResolvedPositionSeconds != 200 {
+		t.Fatalf("expected 100%% to resolve to 200, got %d", resultHundred.ResolvedPositionSeconds)
+	}
+
+	fromEnd := 999
+	resultFromEnd, err := manager.SeekBeaming(context.Background(), domain.SeekRequest{
+		SessionID:      "sess_seek_bounds",
+		FromEndSeconds: &fromEnd,
+	})
+	if err != nil {
+		t.Fatalf("seek from end: %v", err)
+	}
+	if resultFromEnd.ResolvedPositionSeconds != 0 {
+		t.Fatalf("expected from-end larger than duration to resolve to 0, got %d", resultFromEnd.ResolvedPositionSeconds)
 	}
 }
 

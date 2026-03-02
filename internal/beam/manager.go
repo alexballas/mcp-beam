@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net"
 	"net/url"
@@ -46,6 +47,10 @@ const (
 	defaultRetryAttempts    = 3
 	defaultRetryBaseBackoff = 120 * time.Millisecond
 	defaultRetryMaxBackoff  = 800 * time.Millisecond
+
+	seekModeAbsoluteSeconds = "absolute_seconds"
+	seekModePercent         = "percent"
+	seekModeFromEndSeconds  = "from_end_seconds"
 )
 
 type deviceLister interface {
@@ -241,6 +246,103 @@ func (m *Manager) StopBeaming(_ context.Context, req domain.StopRequest) (*domai
 		OK:               true,
 		StoppedSessionID: sess.ID,
 		DeviceID:         sess.DeviceID,
+	}, nil
+}
+
+func (m *Manager) SeekBeaming(ctx context.Context, req domain.SeekRequest) (*domain.SeekResult, error) {
+	if m.isClosed() {
+		return nil, toolError("INTERNAL_ERROR", "beam manager is shutting down")
+	}
+	if req.SessionID == "" && req.TargetDevice == "" {
+		return nil, toolError("INTERNAL_ERROR", "either session_id or target_device is required")
+	}
+
+	modeCount := 0
+	if req.PositionSeconds != nil {
+		if *req.PositionSeconds < 0 {
+			return nil, seekPositionInvalidError("position_seconds must be >= 0")
+		}
+		modeCount++
+	}
+	if req.PositionPercent != nil {
+		if *req.PositionPercent < 0 || *req.PositionPercent > 100 {
+			return nil, seekPositionInvalidError("position_percent must be in range [0, 100]")
+		}
+		modeCount++
+	}
+	if req.FromEndSeconds != nil {
+		if *req.FromEndSeconds < 0 {
+			return nil, seekPositionInvalidError("from_end_seconds must be >= 0")
+		}
+		modeCount++
+	}
+	if modeCount != 1 {
+		return nil, seekModeInvalidError("exactly one seek mode is required")
+	}
+
+	sess := m.findSession(req)
+	if sess == nil {
+		return nil, toolError("DEVICE_NOT_FOUND", "no active session matches the provided target")
+	}
+
+	resolvedSeconds, durationSeconds, mode, err := m.resolveSeekPosition(ctx, sess, req)
+	if err != nil {
+		return nil, err
+	}
+
+	switch sess.Protocol {
+	case "chromecast":
+		if sess.castClient == nil {
+			return nil, toolError("INTERNAL_ERROR", "chromecast session is not configured")
+		}
+		if err := m.withRetry(ctx, func() error {
+			return sess.castClient.Seek(resolvedSeconds)
+		}); err != nil {
+			return nil, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to seek Chromecast playback: %v", err))
+		}
+
+		observedAt := m.now()
+		sess.stateMu.Lock()
+		sess.recordObservationLocked("playing", strconv.Itoa(resolvedSeconds), observedAt)
+		sess.stateMu.Unlock()
+	case "dlna":
+		if sess.dlnaPayload == nil {
+			return nil, toolError("INTERNAL_ERROR", "dlna session is not configured")
+		}
+
+		reltime, err := utils.SecondsToClockTime(resolvedSeconds)
+		if err != nil {
+			return nil, toolError("INTERNAL_ERROR", fmt.Sprintf("invalid seek position: %v", err))
+		}
+		if err := m.withRetry(ctx, func() error {
+			return sess.dlnaPayload.SeekSoapCall(reltime)
+		}); err != nil {
+			return nil, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to seek DLNA playback: %v", err))
+		}
+
+		observedAt := m.now()
+		sess.stateMu.Lock()
+		sess.lastDLNAPosition = reltime
+		sess.recordObservationLocked("playing", reltime, observedAt)
+		sess.stateMu.Unlock()
+	default:
+		return nil, unsupportedProtocolError(sess.Protocol)
+	}
+
+	var durationPtr *float64
+	if durationSeconds > 0 {
+		duration := durationSeconds
+		durationPtr = &duration
+	}
+
+	return &domain.SeekResult{
+		OK:                      true,
+		SessionID:               sess.ID,
+		DeviceID:                sess.DeviceID,
+		PositionSeconds:         resolvedSeconds,
+		RequestedMode:           mode,
+		ResolvedPositionSeconds: resolvedSeconds,
+		DurationSeconds:         durationPtr,
 	}, nil
 }
 
@@ -1104,6 +1206,132 @@ func (m *Manager) takeSession(req domain.StopRequest) *session {
 	return nil
 }
 
+func (m *Manager) findSession(req domain.SeekRequest) *session {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if req.SessionID != "" {
+		return m.sessionsByID[req.SessionID]
+	}
+
+	target := strings.TrimSpace(req.TargetDevice)
+	if target == "" {
+		return nil
+	}
+
+	for _, sess := range m.sessionsByID {
+		if sess == nil {
+			continue
+		}
+		if sess.DeviceID == target || sess.DeviceName == target {
+			return sess
+		}
+		if strings.EqualFold(strings.TrimSpace(sess.DeviceID), target) ||
+			strings.EqualFold(strings.TrimSpace(sess.DeviceName), target) {
+			return sess
+		}
+	}
+
+	return nil
+}
+
+func (m *Manager) resolveSeekPosition(ctx context.Context, sess *session, req domain.SeekRequest) (resolvedSeconds int, durationSeconds float64, mode string, err error) {
+	if req.PositionSeconds != nil {
+		return *req.PositionSeconds, 0, seekModeAbsoluteSeconds, nil
+	}
+
+	duration, err := m.sessionDurationSeconds(ctx, sess)
+	if err != nil {
+		return 0, 0, "", err
+	}
+	if duration <= 0 {
+		return 0, 0, "", seekDurationUnknownError()
+	}
+
+	if req.PositionPercent != nil {
+		resolved := int(math.Round(duration * (*req.PositionPercent) / 100.0))
+		if resolved < 0 {
+			resolved = 0
+		}
+		return resolved, duration, seekModePercent, nil
+	}
+
+	if req.FromEndSeconds != nil {
+		target := duration - float64(*req.FromEndSeconds)
+		if target < 0 {
+			target = 0
+		}
+		resolved := int(math.Round(target))
+		if resolved < 0 {
+			resolved = 0
+		}
+		return resolved, duration, seekModeFromEndSeconds, nil
+	}
+
+	return 0, 0, "", seekModeInvalidError("exactly one seek mode is required")
+}
+
+func (m *Manager) sessionDurationSeconds(ctx context.Context, sess *session) (float64, error) {
+	if sess == nil {
+		return 0, seekDurationUnknownError()
+	}
+
+	switch sess.Protocol {
+	case "chromecast":
+		if sess.castClient == nil {
+			return 0, toolError("INTERNAL_ERROR", "chromecast session is not configured")
+		}
+
+		var statusDuration float64
+		if err := m.withRetry(ctx, func() error {
+			status, err := sess.castClient.GetStatus()
+			if err != nil {
+				return err
+			}
+			if status == nil || status.Duration <= 0 {
+				statusDuration = 0
+				return nil
+			}
+			statusDuration = float64(status.Duration)
+			return nil
+		}); err != nil {
+			return 0, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to query Chromecast playback status: %v", err))
+		}
+
+		if statusDuration <= 0 {
+			return 0, nil
+		}
+		return statusDuration, nil
+	case "dlna":
+		if sess.dlnaPayload == nil {
+			return 0, toolError("INTERNAL_ERROR", "dlna session is not configured")
+		}
+
+		var position []string
+		if err := m.withRetry(ctx, func() error {
+			p, err := sess.dlnaPayload.GetPositionInfo()
+			if err != nil {
+				return err
+			}
+			position = p
+			return nil
+		}); err != nil {
+			return 0, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to query DLNA playback position: %v", err))
+		}
+		if len(position) == 0 {
+			return 0, nil
+		}
+
+		durationSeconds, err := utils.ClockTimeToSeconds(strings.TrimSpace(position[0]))
+		if err != nil || durationSeconds <= 0 {
+			return 0, nil
+		}
+		return float64(durationSeconds), nil
+	default:
+		return 0, unsupportedProtocolError(sess.Protocol)
+	}
+}
+
 func (m *Manager) initializeSessionLifecycle(sess *session, state, position string) {
 	if sess == nil {
 		return
@@ -1681,6 +1909,31 @@ func (d *dlnaMonitorScreen) SetMediaType(string) {}
 
 func toolError(code, message string) *domain.ToolError {
 	return &domain.ToolError{Code: code, Message: message}
+}
+
+func seekModeInvalidError(message string) *domain.ToolError {
+	return &domain.ToolError{
+		Code:    "SEEK_MODE_INVALID",
+		Message: message,
+	}
+}
+
+func seekPositionInvalidError(message string) *domain.ToolError {
+	return &domain.ToolError{
+		Code:    "SEEK_POSITION_INVALID",
+		Message: message,
+	}
+}
+
+func seekDurationUnknownError() *domain.ToolError {
+	return &domain.ToolError{
+		Code:    "SEEK_DURATION_UNKNOWN",
+		Message: "duration required for relative seek mode",
+		SuggestedFixes: []string{
+			"use absolute position_seconds",
+			"wait until playback metadata is available",
+		},
+	}
 }
 
 func unsupportedProtocolError(protocol string) *domain.ToolError {

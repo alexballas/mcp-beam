@@ -57,6 +57,10 @@ func (c *CastClientAdapter) Load(mediaURL, contentType string, startTime int, du
 	return c.client.Load(mediaURL, contentType, startTime, duration, subtitleURL, live)
 }
 
+func (c *CastClientAdapter) Seek(seconds int) error {
+	return c.client.Seek(seconds)
+}
+
 func (c *CastClientAdapter) Stop() error {
 	return c.client.Stop()
 }
@@ -86,6 +90,10 @@ type DLNAPayloadAdapter struct {
 
 func (d *DLNAPayloadAdapter) SendtoTV(action string) error {
 	return d.payload.SendtoTV(action)
+}
+
+func (d *DLNAPayloadAdapter) SeekSoapCall(reltime string) error {
+	return d.payload.SeekSoapCall(reltime)
 }
 
 func (d *DLNAPayloadAdapter) GetTransportInfo() ([]string, error) {

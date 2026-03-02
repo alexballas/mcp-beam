@@ -18,6 +18,7 @@ type Discovery interface {
 type CastClient interface {
 	Connect() error
 	Load(mediaURL, contentType string, startTime int, duration float64, subtitleURL string, live bool) error
+	Seek(seconds int) error
 	Stop() error
 	GetStatus() (*castprotocol.CastStatus, error)
 	Close(stopMedia bool) error
@@ -31,6 +32,7 @@ type CastFactory interface {
 // DLNAPayload represents a DLNA control channel.
 type DLNAPayload interface {
 	SendtoTV(action string) error
+	SeekSoapCall(reltime string) error
 	GetTransportInfo() ([]string, error)
 	GetPositionInfo() ([]string, error)
 	ListenAddress() string

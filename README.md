@@ -11,9 +11,10 @@
 
 `mcp-beam` is a MCP server (`stdio` transport) for casting local files and media URLs to Chromecast and DLNA/UPnP devices on your LAN.
 
-It exposes three tools:
+It exposes four tools:
 - `list_local_hardware`
 - `beam_media`
+- `seek_beaming`
 - `stop_beaming`
 
 ## Highlights
@@ -90,7 +91,8 @@ go run go2tv.app/mcp-beam@latest --self-test
 
 1. Call `list_local_hardware` and pick a device `id`.
 2. Call `beam_media` with `source` and `target_device`.
-3. Call `stop_beaming` when done.
+3. Call `seek_beaming` as needed.
+4. Call `stop_beaming` when done.
 
 Minimal example flow:
 
@@ -111,6 +113,16 @@ Minimal example flow:
     "source": "/absolute/path/to/video.mp4",
     "target_device": "dev_1234abcd",
     "transcode": "auto"
+  }
+}
+```
+
+```json
+{
+  "name": "seek_beaming",
+  "arguments": {
+    "session_id": "sess_abcd1234",
+    "position_percent": 50
   }
 }
 ```
@@ -375,6 +387,48 @@ On success, `structuredContent` includes:
 - `stopped_session_id`
 - `device_id`
 
+### `seek_beaming`
+
+Seek an active beam session by absolute position, percentage, or from-end offset.
+
+Arguments:
+- `target_device` (optional string)
+- `session_id` (optional string)
+- Exactly one of:
+- `position_seconds` (integer, minimum `0`)
+- `position_percent` (number, range `0` to `100`)
+- `from_end_seconds` (integer, minimum `0`)
+- At least one of `target_device` or `session_id` is required.
+
+Example:
+
+```json
+{
+  "name": "seek_beaming",
+  "arguments": {
+    "session_id": "sess_abcd1234",
+    "from_end_seconds": 10
+  }
+}
+```
+
+On success, `structuredContent` includes:
+- `ok`
+- `session_id`
+- `device_id`
+- `position_seconds`
+- `requested_mode`
+- `resolved_position_seconds`
+- optional `duration_seconds`
+
+Examples:
+- Middle of media: `position_percent: 50`
+- Ten seconds from end: `from_end_seconds: 10`
+- Exact second: `position_seconds: 120`
+
+Note:
+- Relative modes (`position_percent`, `from_end_seconds`) require known media duration.
+
 ## Transcode Behavior
 
 `beam_media.arguments.transcode` values:
@@ -484,7 +538,8 @@ Runtime model:
 Core flow:
 1. `list_local_hardware`: discover, normalize, stable IDs, optional reachability filter.
 2. `beam_media`: validate source, resolve target, choose protocol, decide transcode, start playback, persist session.
-3. `stop_beaming`: resolve session/device, stop protocol playback, tear down runtime resources.
+3. `seek_beaming`: seek active sessions by `session_id` or `target_device`.
+4. `stop_beaming`: resolve session/device, stop protocol playback, tear down runtime resources.
 
 Session lifecycle defaults:
 - `idle_cleanup_after = 10m`

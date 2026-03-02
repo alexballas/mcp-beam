@@ -31,6 +31,7 @@ type LocalHardwareLister interface {
 type BeamController interface {
 	BeamMedia(ctx context.Context, req domain.BeamRequest) (*domain.BeamResult, error)
 	StopBeaming(ctx context.Context, req domain.StopRequest) (*domain.StopResult, error)
+	SeekBeaming(ctx context.Context, req domain.SeekRequest) (*domain.SeekResult, error)
 }
 
 type Server struct {
@@ -191,6 +192,8 @@ func (s *Server) handleToolCall(ctx context.Context, id json.RawMessage, rawPara
 		return s.handleBeamMediaCall(ctx, id, params.Arguments)
 	case "stop_beaming":
 		return s.handleStopBeamingCall(ctx, id, params.Arguments)
+	case "seek_beaming":
+		return s.handleSeekBeamingCall(ctx, id, params.Arguments)
 	default:
 		s.logCall(params.Name, "", "", startedAt, "TOOL_NOT_FOUND")
 		return s.send(response{
@@ -368,6 +371,92 @@ func (s *Server) handleStopBeamingCall(ctx context.Context, id json.RawMessage, 
 				{
 					Type: "text",
 					Text: fmt.Sprintf("Stopped beaming session %s.", result.StoppedSessionID),
+				},
+			},
+			StructuredContent: result,
+		},
+	})
+}
+
+func (s *Server) handleSeekBeamingCall(ctx context.Context, id json.RawMessage, rawArgs json.RawMessage) error {
+	startedAt := time.Now()
+
+	if s.beamController == nil {
+		return s.sendToolInternalError("seek_beaming", "", "", startedAt, id, "beam controller is not configured")
+	}
+
+	var args struct {
+		TargetDevice    *string  `json:"target_device,omitempty"`
+		SessionID       *string  `json:"session_id,omitempty"`
+		PositionSeconds *int     `json:"position_seconds,omitempty"`
+		PositionPercent *float64 `json:"position_percent,omitempty"`
+		FromEndSeconds  *int     `json:"from_end_seconds,omitempty"`
+	}
+	if err := decodeStrict(rawArgs, &args); err != nil {
+		return s.sendInvalidParams("seek_beaming", "", "", startedAt, id)
+	}
+
+	targetDevice := ""
+	sessionID := ""
+	if args.TargetDevice != nil {
+		targetDevice = strings.TrimSpace(*args.TargetDevice)
+	}
+	if args.SessionID != nil {
+		sessionID = strings.TrimSpace(*args.SessionID)
+	}
+
+	if targetDevice == "" && sessionID == "" {
+		return s.sendInvalidParams("seek_beaming", targetDevice, sessionID, startedAt, id)
+	}
+
+	modeCount := 0
+	if args.PositionSeconds != nil {
+		if *args.PositionSeconds < 0 {
+			return s.sendInvalidParams("seek_beaming", targetDevice, sessionID, startedAt, id)
+		}
+		modeCount++
+	}
+	if args.PositionPercent != nil {
+		if *args.PositionPercent < 0 || *args.PositionPercent > 100 {
+			return s.sendInvalidParams("seek_beaming", targetDevice, sessionID, startedAt, id)
+		}
+		modeCount++
+	}
+	if args.FromEndSeconds != nil {
+		if *args.FromEndSeconds < 0 {
+			return s.sendInvalidParams("seek_beaming", targetDevice, sessionID, startedAt, id)
+		}
+		modeCount++
+	}
+	if modeCount != 1 {
+		return s.sendInvalidParams("seek_beaming", targetDevice, sessionID, startedAt, id)
+	}
+
+	result, err := s.beamController.SeekBeaming(ctx, domain.SeekRequest{
+		TargetDevice:    targetDevice,
+		SessionID:       sessionID,
+		PositionSeconds: args.PositionSeconds,
+		PositionPercent: args.PositionPercent,
+		FromEndSeconds:  args.FromEndSeconds,
+	})
+	if err != nil {
+		s.logCall("seek_beaming", targetDevice, sessionID, startedAt, toolErrorCode(err))
+		return s.send(response{
+			JSONRPC: "2.0",
+			ID:      id,
+			Result:  toolErrorResultFromError(err),
+		})
+	}
+	s.logCall("seek_beaming", result.DeviceID, result.SessionID, startedAt, "")
+
+	return s.send(response{
+		JSONRPC: "2.0",
+		ID:      id,
+		Result: toolCallResult{
+			Content: []toolContent{
+				{
+					Type: "text",
+					Text: fmt.Sprintf("Seeked session %s to %d second(s).", result.SessionID, result.ResolvedPositionSeconds),
 				},
 			},
 			StructuredContent: result,
@@ -659,6 +748,49 @@ func staticTools() []tool {
 					},
 				},
 				"minProperties":        1,
+				"additionalProperties": false,
+			},
+		},
+		{
+			Name:        "seek_beaming",
+			Description: "Seek active playback by absolute seconds, percentage, or from-end offset on a selected device or session. Provide exactly one seek mode field.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"target_device": map[string]any{
+						"type":        "string",
+						"description": "The device ID or exact name of the session target.",
+					},
+					"session_id": map[string]any{
+						"type":        "string",
+						"description": "The unique session ID to seek. This is returned by a successful 'beam_media' call.",
+					},
+					"position_seconds": map[string]any{
+						"type":        "integer",
+						"minimum":     0,
+						"description": "Absolute seek target in seconds from start of media.",
+					},
+					"position_percent": map[string]any{
+						"type":        "number",
+						"minimum":     0,
+						"maximum":     100,
+						"description": "Relative seek target as percentage of total duration (0-100).",
+					},
+					"from_end_seconds": map[string]any{
+						"type":        "integer",
+						"minimum":     0,
+						"description": "Relative seek target measured from the media end in seconds.",
+					},
+				},
+				"anyOf": []map[string]any{
+					{"required": []string{"target_device"}},
+					{"required": []string{"session_id"}},
+				},
+				"oneOf": []map[string]any{
+					{"required": []string{"position_seconds"}},
+					{"required": []string{"position_percent"}},
+					{"required": []string{"from_end_seconds"}},
+				},
 				"additionalProperties": false,
 			},
 		},
