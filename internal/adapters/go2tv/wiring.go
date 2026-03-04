@@ -57,6 +57,10 @@ func (c *CastClientAdapter) Load(mediaURL, contentType string, startTime int, du
 	return c.client.Load(mediaURL, contentType, startTime, duration, subtitleURL, live)
 }
 
+func (c *CastClientAdapter) LoadOnExisting(mediaURL, contentType string, startTime int, duration float64, subtitleURL string, live bool) error {
+	return c.client.LoadOnExisting(mediaURL, contentType, startTime, duration, subtitleURL, live)
+}
+
 func (c *CastClientAdapter) Seek(seconds int) error {
 	return c.client.Seek(seconds)
 }

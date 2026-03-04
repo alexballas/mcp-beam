@@ -94,30 +94,32 @@ func (f *fakeCastFactory) NewCastClient(deviceAddr string) (adapters.CastClient,
 }
 
 type fakeCastClient struct {
-	deviceAddr   string
-	connectErr   error
-	connectErrs  []error
-	connectDelay time.Duration
-	loadErr      error
-	loadErrs     []error
-	loadDelay    time.Duration
-	loadBlock    <-chan struct{}
-	seekErr      error
-	stopErr      error
-	closeErr     error
-	statusErr    error
-	statuses     []castprotocol.CastStatus
-	loadURL      string
-	loadType     string
-	loadLive     bool
-	loadSubtitle string
-	seekSeconds  int
-	connectCalls int
-	loadCalls    int
-	seekCalls    int
-	stopCalls    int
-	closeCalls   int
-	statusCalls  int
+	deviceAddr          string
+	connectErr          error
+	connectErrs         []error
+	connectDelay        time.Duration
+	loadErr             error
+	loadErrs            []error
+	loadOnExistingErr   error
+	loadDelay           time.Duration
+	loadBlock           <-chan struct{}
+	seekErr             error
+	stopErr             error
+	closeErr            error
+	statusErr           error
+	statuses            []castprotocol.CastStatus
+	loadURL             string
+	loadType            string
+	loadLive            bool
+	loadSubtitle        string
+	seekSeconds         int
+	connectCalls        int
+	loadCalls           int
+	loadOnExistingCalls int
+	seekCalls           int
+	stopCalls           int
+	closeCalls          int
+	statusCalls         int
 
 	mu sync.Mutex
 }
@@ -161,6 +163,21 @@ func (f *fakeCastClient) Load(mediaURL, contentType string, startTime int, durat
 		}
 	}
 	return f.loadErr
+}
+
+func (f *fakeCastClient) LoadOnExisting(mediaURL, contentType string, startTime int, duration float64, subtitleURL string, live bool) error {
+	if f.loadDelay > 0 {
+		time.Sleep(f.loadDelay)
+	}
+	if f.loadBlock != nil {
+		<-f.loadBlock
+	}
+	f.loadOnExistingCalls++
+	f.loadURL = mediaURL
+	f.loadType = contentType
+	f.loadLive = live
+	f.loadSubtitle = subtitleURL
+	return f.loadOnExistingErr
 }
 
 func (f *fakeCastClient) Stop() error {
@@ -368,6 +385,9 @@ func (f *fakeServerFactory) New(addr string) streamServer {
 type fakeServer struct {
 	addr              string
 	addCount          int
+	addPaths          []string
+	lastTranscodeOpts *utils.TranscodeOptions
+	lastMedia         any
 	startCalled       bool
 	startServerCalled bool
 	stopCalled        bool
@@ -376,6 +396,9 @@ type fakeServer struct {
 
 func (f *fakeServer) AddHandler(path string, payload *soapcalls.TVPayload, transcode *utils.TranscodeOptions, media any) {
 	f.addCount++
+	f.addPaths = append(f.addPaths, path)
+	f.lastTranscodeOpts = transcode
+	f.lastMedia = media
 }
 
 func (f *fakeServer) StartServing(serverStarted chan<- error) {
@@ -517,6 +540,71 @@ func TestSeekBeamingChromecastBySessionID(t *testing.T) {
 	}
 }
 
+func TestSeekBeamingChromecastTranscodedBySessionID(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	defer manager.Close(context.Background())
+
+	castClient := &fakeCastClient{}
+	server := &fakeServer{addr: "127.0.0.1:3551"}
+	sess := &session{
+		ID:            "sess_seek_cast_tc",
+		DeviceID:      "dev_cast",
+		DeviceName:    "Living Room",
+		Protocol:      "chromecast",
+		Transcoding:   true,
+		MediaURL:      "http://127.0.0.1:3551/media-old.mp4",
+		mediaDuration: 200,
+		castClient:    castClient,
+		httpServer:    server,
+		castSeekPlan: &chromecastTranscodeSeek{
+			sourcePath: "/tmp/video.mp4",
+			ffmpegPath: "/usr/bin/ffmpeg",
+			subsPath:   "/tmp/subs.srt",
+			route:      "/media-new.mp4",
+		},
+	}
+	manager.initializeSessionLifecycle(sess, "playing", "10")
+	if _, stored := manager.storeSession(sess); !stored {
+		t.Fatal("expected session to be stored")
+	}
+
+	seekPosition := 95
+	result, err := manager.SeekBeaming(context.Background(), domain.SeekRequest{
+		SessionID:       "sess_seek_cast_tc",
+		PositionSeconds: &seekPosition,
+	})
+	if err != nil {
+		t.Fatalf("seek beaming: %v", err)
+	}
+	if !result.OK {
+		t.Fatal("expected seek OK=true")
+	}
+	if castClient.seekCalls != 0 {
+		t.Fatalf("expected native Seek to be skipped for transcoded session, got %d calls", castClient.seekCalls)
+	}
+	if castClient.loadOnExistingCalls != 1 {
+		t.Fatalf("expected one LoadOnExisting call, got %d", castClient.loadOnExistingCalls)
+	}
+	if castClient.loadURL != "http://127.0.0.1:3551/media-new.mp4" {
+		t.Fatalf("unexpected load URL: %s", castClient.loadURL)
+	}
+	if server.addCount != 1 {
+		t.Fatalf("expected one handler update, got %d", server.addCount)
+	}
+	if len(server.addPaths) == 0 || server.addPaths[0] != "/media-new.mp4" {
+		t.Fatalf("unexpected handler paths: %v", server.addPaths)
+	}
+	if server.lastTranscodeOpts == nil {
+		t.Fatal("expected transcode options for handler update")
+	}
+	if server.lastTranscodeOpts.SeekSeconds != 95 {
+		t.Fatalf("expected SeekSeconds=95, got %d", server.lastTranscodeOpts.SeekSeconds)
+	}
+	if mediaPath, ok := server.lastMedia.(string); !ok || mediaPath != "/tmp/video.mp4" {
+		t.Fatalf("unexpected handler media value: %#v", server.lastMedia)
+	}
+}
+
 func TestSeekBeamingDLNAByTargetDevice(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
 	defer manager.Close(context.Background())
@@ -550,6 +638,47 @@ func TestSeekBeamingDLNAByTargetDevice(t *testing.T) {
 	}
 	if result.RequestedMode != "absolute_seconds" {
 		t.Fatalf("expected absolute_seconds, got %s", result.RequestedMode)
+	}
+}
+
+func TestSeekBeamingDLNATranscodedByTargetDevice(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	defer manager.Close(context.Background())
+
+	dlnaPayload := &fakeDLNAPayload{listenAddr: "127.0.0.1:3511"}
+	dlnaPayload.rawPayload = &soapcalls.TVPayload{FFmpegSeek: 0}
+	sess := &session{
+		ID:          "sess_seek_dlna_tc",
+		DeviceID:    "dev_dlna",
+		DeviceName:  "Bedroom TV",
+		Protocol:    "dlna",
+		Transcoding: true,
+		dlnaPayload: dlnaPayload,
+	}
+	manager.initializeSessionLifecycle(sess, "playing", "00:00:10")
+	if _, stored := manager.storeSession(sess); !stored {
+		t.Fatal("expected session to be stored")
+	}
+
+	seekPosition := 90
+	result, err := manager.SeekBeaming(context.Background(), domain.SeekRequest{
+		TargetDevice:    "Bedroom TV",
+		PositionSeconds: &seekPosition,
+	})
+	if err != nil {
+		t.Fatalf("seek beaming: %v", err)
+	}
+	if !result.OK {
+		t.Fatal("expected seek OK=true")
+	}
+	if dlnaPayload.actionCount("Play1") != 1 {
+		t.Fatalf("expected Play1 action once, got %d", dlnaPayload.actionCount("Play1"))
+	}
+	if dlnaPayload.RawPayload().FFmpegSeek != 90 {
+		t.Fatalf("expected FFmpegSeek=90, got %d", dlnaPayload.RawPayload().FFmpegSeek)
+	}
+	if dlnaPayload.seekRelTime != "00:01:30" {
+		t.Fatalf("expected follow-up reltime 00:01:30, got %s", dlnaPayload.seekRelTime)
 	}
 }
 
@@ -1288,6 +1417,51 @@ func TestBeamMediaDLNAOperationTimeout(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(toolErr.Message), "context deadline exceeded") {
 		t.Fatalf("expected context deadline message, got %q", toolErr.Message)
+	}
+}
+
+func TestBeamMediaDLNARebindsPayloadContextForSessionLifecycle(t *testing.T) {
+	tmpDir := t.TempDir()
+	mediaPath := filepath.Join(tmpDir, "sample.mp4")
+	if err := os.WriteFile(mediaPath, []byte("not-real-media"), 0o600); err != nil {
+		t.Fatalf("write media file: %v", err)
+	}
+
+	payload := &fakeDLNAPayload{listenAddr: "127.0.0.1:3571"}
+	manager := NewManager(&fakeDiscovery{devices: []domain.Device{{
+		ID:       "dlna_ctx",
+		Name:     "Context TV",
+		Address:  "http://192.168.1.15:1400/device.xml",
+		Protocol: "dlna",
+	}}}, nil, &fakeDLNAFactory{payloads: []*fakeDLNAPayload{payload}})
+	defer manager.Close(context.Background())
+	manager.serverFactory = &fakeServerFactory{}
+	manager.beamOperationTimeout = 40 * time.Millisecond
+
+	result, err := manager.BeamMedia(context.Background(), domain.BeamRequest{
+		Source:       mediaPath,
+		TargetDevice: "dlna_ctx",
+		Transcode:    "never",
+	})
+	if err != nil {
+		t.Fatalf("beam media: %v", err)
+	}
+	if !result.OK {
+		t.Fatal("expected OK result")
+	}
+
+	time.Sleep(80 * time.Millisecond)
+
+	payload.mu.Lock()
+	defer payload.mu.Unlock()
+	if payload.setContextCalls < 2 {
+		t.Fatalf("expected payload context to be rebound for session lifecycle, got %d setContext calls", payload.setContextCalls)
+	}
+	if payload.ctx == nil {
+		t.Fatal("expected payload context to be set")
+	}
+	if payload.ctx.Err() != nil {
+		t.Fatalf("expected long-lived payload context, got err=%v", payload.ctx.Err())
 	}
 }
 

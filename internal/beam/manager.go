@@ -130,10 +130,13 @@ type session struct {
 	Warnings    []string
 	Protocol    string
 
+	mediaDuration float64
+
 	castClient   adapters.CastClient
 	dlnaPayload  adapters.DLNAPayload
 	httpServer   streamServer
 	sourceCloser io.Closer
+	castSeekPlan *chromecastTranscodeSeek
 
 	monitorCancel context.CancelFunc
 	monitorDone   chan struct{}
@@ -155,6 +158,13 @@ type session struct {
 	closeOnce sync.Once
 }
 
+type chromecastTranscodeSeek struct {
+	sourcePath string
+	ffmpegPath string
+	subsPath   string
+	route      string
+}
+
 type preparedPlayback struct {
 	mediaURL      string
 	mediaType     string
@@ -165,6 +175,7 @@ type preparedPlayback struct {
 	warnings      []string
 	httpServer    streamServer
 	sourceCloser  io.Closer
+	castSeekPlan  *chromecastTranscodeSeek
 }
 
 type preparedDLNA struct {
@@ -271,6 +282,9 @@ func (m *Manager) StopBeaming(_ context.Context, req domain.StopRequest) (*domai
 }
 
 func (m *Manager) SeekBeaming(ctx context.Context, req domain.SeekRequest) (*domain.SeekResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if m.isClosed() {
 		return nil, toolError("INTERNAL_ERROR", "beam manager is shutting down")
 	}
@@ -316,10 +330,17 @@ func (m *Manager) SeekBeaming(ctx context.Context, req domain.SeekRequest) (*dom
 		if sess.castClient == nil {
 			return nil, toolError("INTERNAL_ERROR", "chromecast session is not configured")
 		}
-		if err := m.withRetry(ctx, func() error {
-			return sess.castClient.Seek(resolvedSeconds)
-		}); err != nil {
-			return nil, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to seek Chromecast playback: %v", err))
+
+		if sess.Transcoding {
+			if err := m.seekChromecastTranscoded(ctx, sess, resolvedSeconds); err != nil {
+				return nil, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to seek Chromecast transcoded playback: %v", err))
+			}
+		} else {
+			if err := m.withRetry(ctx, func() error {
+				return sess.castClient.Seek(resolvedSeconds)
+			}); err != nil {
+				return nil, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to seek Chromecast playback: %v", err))
+			}
 		}
 
 		observedAt := m.now()
@@ -335,10 +356,17 @@ func (m *Manager) SeekBeaming(ctx context.Context, req domain.SeekRequest) (*dom
 		if err != nil {
 			return nil, toolError("INTERNAL_ERROR", fmt.Sprintf("invalid seek position: %v", err))
 		}
-		if err := m.withRetry(ctx, func() error {
-			return sess.dlnaPayload.SeekSoapCall(reltime)
-		}); err != nil {
-			return nil, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to seek DLNA playback: %v", err))
+
+		if sess.Transcoding {
+			if err := m.seekDLNATranscoded(ctx, sess, resolvedSeconds, reltime); err != nil {
+				return nil, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to seek DLNA transcoded playback: %v", err))
+			}
+		} else {
+			if err := m.withRetry(ctx, func() error {
+				return sess.dlnaPayload.SeekSoapCall(reltime)
+			}); err != nil {
+				return nil, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to seek DLNA playback: %v", err))
+			}
 		}
 
 		observedAt := m.now()
@@ -365,6 +393,73 @@ func (m *Manager) SeekBeaming(ctx context.Context, req domain.SeekRequest) (*dom
 		ResolvedPositionSeconds: resolvedSeconds,
 		DurationSeconds:         durationPtr,
 	}, nil
+}
+
+func (m *Manager) seekChromecastTranscoded(ctx context.Context, sess *session, resolvedSeconds int) error {
+	if sess == nil || sess.castClient == nil {
+		return errors.New("chromecast session is not configured")
+	}
+	if sess.castSeekPlan == nil {
+		return errors.New("transcoded seek is unsupported for this chromecast session")
+	}
+	if sess.httpServer == nil {
+		return errors.New("stream server is not configured")
+	}
+
+	parsedMediaURL, err := url.Parse(sess.MediaURL)
+	if err != nil || parsedMediaURL.Host == "" {
+		return fmt.Errorf("invalid session media url: %s", sess.MediaURL)
+	}
+
+	plan := sess.castSeekPlan
+	sess.httpServer.AddHandler(plan.route, nil, &utils.TranscodeOptions{
+		FFmpegPath:   plan.ffmpegPath,
+		SubsPath:     plan.subsPath,
+		SeekSeconds:  resolvedSeconds,
+		SubtitleSize: utils.SubtitleSizeMedium,
+	}, plan.sourcePath)
+
+	mediaURL := "http://" + parsedMediaURL.Host + plan.route
+	loadResultCh := make(chan error, 1)
+	go func() {
+		loadResultCh <- sess.castClient.LoadOnExisting(mediaURL, "video/mp4", 0, sess.mediaDuration, "", false)
+	}()
+
+	if err := m.waitForChromecastPlaybackStart(ctx, sess.castClient, loadResultCh); err != nil {
+		return err
+	}
+
+	sess.MediaURL = mediaURL
+	return nil
+}
+
+func (m *Manager) seekDLNATranscoded(ctx context.Context, sess *session, resolvedSeconds int, reltime string) error {
+	if sess == nil || sess.dlnaPayload == nil {
+		return errors.New("dlna session is not configured")
+	}
+
+	raw := sess.dlnaPayload.RawPayload()
+	if raw == nil {
+		return errors.New("dlna payload details are unavailable")
+	}
+	raw.FFmpegSeek = resolvedSeconds
+
+	// Best effort: stop first to force a clean transport restart on strict renderers.
+	_ = m.withRetry(ctx, func() error {
+		return sess.dlnaPayload.SendtoTV("Stop")
+	})
+
+	if err := m.withRetry(ctx, func() error {
+		return sess.dlnaPayload.SendtoTV("Play1")
+	}); err != nil {
+		return err
+	}
+
+	// Best effort: some renderers still expect a follow-up Seek command.
+	_ = m.withRetry(ctx, func() error {
+		return sess.dlnaPayload.SeekSoapCall(reltime)
+	})
+	return nil
 }
 
 func (m *Manager) beamChromecast(ctx context.Context, req domain.BeamRequest, device *domain.Device, mode string) (*domain.BeamResult, error) {
@@ -403,16 +498,18 @@ func (m *Manager) beamChromecast(ctx context.Context, req domain.BeamRequest, de
 	}
 
 	sess := &session{
-		ID:           newSessionID(),
-		DeviceID:     device.ID,
-		DeviceName:   device.Name,
-		MediaURL:     playback.mediaURL,
-		Transcoding:  playback.transcoding,
-		Warnings:     playback.warnings,
-		Protocol:     "chromecast",
-		castClient:   client,
-		httpServer:   playback.httpServer,
-		sourceCloser: playback.sourceCloser,
+		ID:            newSessionID(),
+		DeviceID:      device.ID,
+		DeviceName:    device.Name,
+		MediaURL:      playback.mediaURL,
+		Transcoding:   playback.transcoding,
+		Warnings:      playback.warnings,
+		Protocol:      "chromecast",
+		mediaDuration: playback.mediaDuration,
+		castClient:    client,
+		httpServer:    playback.httpServer,
+		sourceCloser:  playback.sourceCloser,
+		castSeekPlan:  playback.castSeekPlan,
 	}
 	m.initializeSessionLifecycle(sess, "buffering", "")
 	replaced, stored := m.storeSession(sess)
@@ -508,6 +605,7 @@ func (m *Manager) beamDLNA(ctx context.Context, req domain.BeamRequest, device *
 	}
 
 	monitorCtx, monitorCancel := context.WithCancel(context.Background())
+	prepared.payload.SetContext(monitorCtx)
 	sess := &session{
 		ID:            newSessionID(),
 		DeviceID:      device.ID,
@@ -639,6 +737,7 @@ func (m *Manager) prepareFilePlayback(req domain.BeamRequest, device *domain.Dev
 	route := mediaRouteFor(source)
 	var tcOpts *utils.TranscodeOptions
 	mediaDuration := 0.0
+	var castSeekPlan *chromecastTranscodeSeek
 	if transcoding {
 		tcOpts = &utils.TranscodeOptions{
 			FFmpegPath:   ffmpegPath,
@@ -647,6 +746,12 @@ func (m *Manager) prepareFilePlayback(req domain.BeamRequest, device *domain.Dev
 			SubtitleSize: utils.SubtitleSizeMedium,
 		}
 		mediaType = "video/mp4"
+		castSeekPlan = &chromecastTranscodeSeek{
+			sourcePath: source,
+			ffmpegPath: ffmpegPath,
+			subsPath:   validatedSubtitlePath(req.SubtitlesPath),
+			route:      route,
+		}
 		if duration, durationErr := utils.DurationForMediaSeconds(ffmpegPath, source); durationErr == nil {
 			mediaDuration = duration
 		} else {
@@ -676,6 +781,7 @@ func (m *Manager) prepareFilePlayback(req domain.BeamRequest, device *domain.Dev
 		mediaDuration: mediaDuration,
 		warnings:      warnings,
 		httpServer:    server,
+		castSeekPlan:  castSeekPlan,
 	}, nil
 }
 
@@ -1403,6 +1509,9 @@ func (m *Manager) sessionDurationSeconds(ctx context.Context, sess *session) (fl
 		}
 
 		if statusDuration <= 0 {
+			if sess.mediaDuration > 0 {
+				return sess.mediaDuration, nil
+			}
 			return 0, nil
 		}
 		return statusDuration, nil
