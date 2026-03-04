@@ -537,6 +537,61 @@ func TestBeamMediaChromecastStartSecondsUsesLoadStartTime(t *testing.T) {
 	}
 }
 
+func TestBeamMediaChromecastStartSecondsWithTranscodingUsesFFmpegSeek(t *testing.T) {
+	tmpDir := t.TempDir()
+	mediaPath := filepath.Join(tmpDir, "sample.mp4")
+	if err := os.WriteFile(mediaPath, []byte("not-real-media"), 0o600); err != nil {
+		t.Fatalf("write media file: %v", err)
+	}
+
+	discovery := &fakeDiscovery{devices: []domain.Device{{
+		ID:       "dev_start_cast_tc",
+		Name:     "Living Room",
+		Address:  "http://127.0.0.1:8009",
+		Protocol: "chromecast",
+	}}}
+	castClient := &fakeCastClient{}
+	manager := NewManager(discovery, &fakeCastFactory{client: castClient}, nil)
+	defer manager.Close(context.Background())
+	serverFactory := &fakeServerFactory{}
+	manager.serverFactory = serverFactory
+	manager.listenAddressForDevice = func(deviceAddress string) (string, error) {
+		return "127.0.0.1:3500", nil
+	}
+	manager.lookPath = func(file string) (string, error) {
+		if file == "ffmpeg" {
+			return "/usr/bin/ffmpeg", nil
+		}
+		return "", errors.New("not found")
+	}
+
+	start := 42
+	result, err := manager.BeamMedia(context.Background(), domain.BeamRequest{
+		Source:       mediaPath,
+		TargetDevice: "dev_start_cast_tc",
+		Transcode:    "always",
+		StartSeconds: &start,
+	})
+	if err != nil {
+		t.Fatalf("beam media: %v", err)
+	}
+	if !result.OK {
+		t.Fatal("expected beam result OK=true")
+	}
+	if castClient.loadStartTime != 0 {
+		t.Fatalf("expected Chromecast load start time 0 for transcoded stream, got %d", castClient.loadStartTime)
+	}
+	if len(serverFactory.servers) != 1 {
+		t.Fatalf("expected one server, got %d", len(serverFactory.servers))
+	}
+	if serverFactory.servers[0].lastTranscodeOpts == nil {
+		t.Fatal("expected transcode options to be set")
+	}
+	if serverFactory.servers[0].lastTranscodeOpts.SeekSeconds != 42 {
+		t.Fatalf("expected ffmpeg SeekSeconds=42, got %d", serverFactory.servers[0].lastTranscodeOpts.SeekSeconds)
+	}
+}
+
 func TestBeamMediaAutoDetectSidecarSubtitlesChromecast(t *testing.T) {
 	tmpDir := t.TempDir()
 	mediaPath := filepath.Join(tmpDir, "movie.mp4")

@@ -494,7 +494,7 @@ func (m *Manager) beamChromecast(ctx context.Context, req domain.BeamRequest, de
 
 	loadResultCh := make(chan error, 1)
 	startTime := 0
-	if req.StartSeconds != nil {
+	if req.StartSeconds != nil && !playback.transcoding {
 		startTime = *req.StartSeconds
 	}
 	go func() {
@@ -754,11 +754,12 @@ func (m *Manager) prepareFilePlayback(req domain.BeamRequest, device *domain.Dev
 	var tcOpts *utils.TranscodeOptions
 	mediaDuration := 0.0
 	var castSeekPlan *chromecastTranscodeSeek
+	startAt := startSeconds(req.StartSeconds)
 	if transcoding {
 		tcOpts = &utils.TranscodeOptions{
 			FFmpegPath:   ffmpegPath,
 			SubsPath:     validatedSubtitlePath(subtitlesPath),
-			SeekSeconds:  0,
+			SeekSeconds:  startAt,
 			SubtitleSize: utils.SubtitleSizeMedium,
 		}
 		mediaType = "video/mp4"
@@ -864,11 +865,12 @@ func (m *Manager) prepareURLPlayback(ctx context.Context, req domain.BeamRequest
 
 	route := mediaRouteFor(sourceURL)
 	var tcOpts *utils.TranscodeOptions
+	startAt := startSeconds(req.StartSeconds)
 	if transcoding {
 		tcOpts = &utils.TranscodeOptions{
 			FFmpegPath:   ffmpegPath,
 			SubsPath:     validatedSubtitlePath(req.SubtitlesPath),
-			SeekSeconds:  0,
+			SeekSeconds:  startAt,
 			SubtitleSize: utils.SubtitleSizeMedium,
 		}
 		mediaType = "video/mp4"
