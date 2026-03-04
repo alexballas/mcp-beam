@@ -125,6 +125,40 @@ func TestInitializeAndToolsList(t *testing.T) {
 	}
 }
 
+func TestToolsListInputSchemasDoNotUseTopLevelCombinators(t *testing.T) {
+	input := bytes.NewBuffer(nil)
+	output := bytes.NewBuffer(nil)
+
+	writeRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      10,
+		"method":  "tools/list",
+	})
+
+	srv := New(input, output, Config{})
+	if err := srv.Run(context.Background()); err != nil {
+		t.Fatalf("run server: %v", err)
+	}
+
+	responses := readResponses(t, output.Bytes())
+	if len(responses) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(responses))
+	}
+
+	toolResult := responses[0]["result"].(map[string]any)
+	tools := toolResult["tools"].([]any)
+	for _, toolAny := range tools {
+		tool := toolAny.(map[string]any)
+		name := tool["name"].(string)
+		schema := tool["inputSchema"].(map[string]any)
+		for _, combinator := range []string{"oneOf", "anyOf", "allOf"} {
+			if _, exists := schema[combinator]; exists {
+				t.Fatalf("tool %q inputSchema must not include top-level %s", name, combinator)
+			}
+		}
+	}
+}
+
 func TestInitializeJSONLineRequest(t *testing.T) {
 	input := bytes.NewBuffer(nil)
 	output := bytes.NewBuffer(nil)

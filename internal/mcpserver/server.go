@@ -820,15 +820,6 @@ func staticTools() []tool {
 						"description": "Relative seek target measured from the media end in seconds.",
 					},
 				},
-				"anyOf": []map[string]any{
-					{"required": []string{"target_device"}},
-					{"required": []string{"session_id"}},
-				},
-				"oneOf": []map[string]any{
-					{"required": []string{"position_seconds"}},
-					{"required": []string{"position_percent"}},
-					{"required": []string{"from_end_seconds"}},
-				},
 				"additionalProperties": false,
 			},
 		},
