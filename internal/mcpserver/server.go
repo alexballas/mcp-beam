@@ -281,6 +281,7 @@ func (s *Server) handleBeamMediaCall(ctx context.Context, id json.RawMessage, ra
 		TargetDevice  string  `json:"target_device"`
 		Transcode     *string `json:"transcode,omitempty"`
 		SubtitlesPath *string `json:"subtitles_path,omitempty"`
+		StartSeconds  *int    `json:"start_seconds,omitempty"`
 	}
 	if err := decodeStrict(rawArgs, &args); err != nil {
 		return s.sendInvalidParams("beam_media", "", "", startedAt, id)
@@ -304,12 +305,16 @@ func (s *Server) handleBeamMediaCall(ctx context.Context, id json.RawMessage, ra
 	if args.SubtitlesPath != nil {
 		subtitlesPath = strings.TrimSpace(*args.SubtitlesPath)
 	}
+	if args.StartSeconds != nil && *args.StartSeconds < 0 {
+		return s.sendInvalidParams("beam_media", args.TargetDevice, "", startedAt, id)
+	}
 
 	result, err := s.beamController.BeamMedia(ctx, domain.BeamRequest{
 		Source:        args.Source,
 		TargetDevice:  args.TargetDevice,
 		Transcode:     transcode,
 		SubtitlesPath: subtitlesPath,
+		StartSeconds:  args.StartSeconds,
 	})
 	if err != nil {
 		s.logCall("beam_media", args.TargetDevice, "", startedAt, toolErrorCode(err))
@@ -405,6 +410,7 @@ func (s *Server) handleSeekBeamingCall(ctx context.Context, id json.RawMessage, 
 		PositionSeconds *int     `json:"position_seconds,omitempty"`
 		PositionPercent *float64 `json:"position_percent,omitempty"`
 		FromEndSeconds  *int     `json:"from_end_seconds,omitempty"`
+		DeltaSeconds    *int     `json:"delta_seconds,omitempty"`
 	}
 	if err := decodeStrict(rawArgs, &args); err != nil {
 		return s.sendInvalidParams("seek_beaming", "", "", startedAt, id)
@@ -442,6 +448,9 @@ func (s *Server) handleSeekBeamingCall(ctx context.Context, id json.RawMessage, 
 		}
 		modeCount++
 	}
+	if args.DeltaSeconds != nil {
+		modeCount++
+	}
 	if modeCount != 1 {
 		return s.sendInvalidParams("seek_beaming", targetDevice, sessionID, startedAt, id)
 	}
@@ -452,6 +461,7 @@ func (s *Server) handleSeekBeamingCall(ctx context.Context, id json.RawMessage, 
 		PositionSeconds: args.PositionSeconds,
 		PositionPercent: args.PositionPercent,
 		FromEndSeconds:  args.FromEndSeconds,
+		DeltaSeconds:    args.DeltaSeconds,
 	})
 	if err != nil {
 		s.logCall("seek_beaming", targetDevice, sessionID, startedAt, toolErrorCode(err))
@@ -765,6 +775,11 @@ func staticTools() []tool {
 						"type":        "string",
 						"description": "Optional absolute local file path to a subtitle file (e.g., .srt, .vtt) to load with the media.",
 					},
+					"start_seconds": map[string]any{
+						"type":        "integer",
+						"minimum":     0,
+						"description": "Optional start offset in seconds from the beginning of media playback.",
+					},
 				},
 				"required":             []string{"source", "target_device"},
 				"additionalProperties": false,
@@ -791,7 +806,7 @@ func staticTools() []tool {
 		},
 		{
 			Name:        "seek_beaming",
-			Description: "Seek active playback by absolute seconds, percentage, or from-end offset on a selected device or session. Provide exactly one seek mode field.",
+			Description: "Seek active playback by absolute seconds, percentage, from-end offset, or relative delta on a selected device or session. Provide exactly one seek mode field.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -818,6 +833,10 @@ func staticTools() []tool {
 						"type":        "integer",
 						"minimum":     0,
 						"description": "Relative seek target measured from the media end in seconds.",
+					},
+					"delta_seconds": map[string]any{
+						"type":        "integer",
+						"description": "Relative seek delta from current playback position in seconds (use negative values to rewind).",
 					},
 				},
 				"additionalProperties": false,

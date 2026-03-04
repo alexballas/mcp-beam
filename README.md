@@ -333,6 +333,7 @@ Arguments:
 - `target_device` (required string): stable device ID preferred, exact name fallback
 - `transcode` (optional string): `auto` (default), `always`, `never`
 - `subtitles_path` (optional string): absolute local subtitle file path (`.srt` or `.vtt`)
+- `start_seconds` (optional integer, minimum `0`): start offset from the beginning of media
 
 Example:
 
@@ -343,7 +344,8 @@ Example:
     "source": "/absolute/path/to/media.mp4",
     "target_device": "dev_1234abcd",
     "transcode": "auto",
-    "subtitles_path": "/absolute/path/to/subs.srt"
+    "subtitles_path": "/absolute/path/to/subs.srt",
+    "start_seconds": 60
   }
 }
 ```
@@ -361,6 +363,7 @@ Protocol notes:
 - Chromecast supports direct `.m3u8` HLS URL casting.
 - DLNA supports local files and URL sources with direct-first then proxy fallback behavior.
 - DLNA `.m3u8` URLs are rejected with structured limitation details.
+- When `subtitles_path` is omitted for local files, mcp-beam auto-detects sidecar subtitles using the same basename (`.srt`, then `.vtt`).
 
 ### `stop_beaming`
 
@@ -389,7 +392,7 @@ On success, `structuredContent` includes:
 
 ### `seek_beaming`
 
-Seek an active beam session by absolute position, percentage, or from-end offset.
+Seek an active beam session by absolute position, percentage, from-end offset, or relative delta.
 
 Arguments:
 - `target_device` (optional string)
@@ -398,6 +401,7 @@ Arguments:
 - `position_seconds` (integer, minimum `0`)
 - `position_percent` (number, range `0` to `100`)
 - `from_end_seconds` (integer, minimum `0`)
+- `delta_seconds` (integer): relative delta from the current playback position; negative values rewind
 - At least one of `target_device` or `session_id` is required.
 
 Example:
@@ -425,6 +429,8 @@ Examples:
 - Middle of media: `position_percent: 50`
 - Ten seconds from end: `from_end_seconds: 10`
 - Exact second: `position_seconds: 120`
+- Skip ahead 30 seconds: `delta_seconds: 30`
+- Rewind 10 seconds: `delta_seconds: -10`
 
 Note:
 - Relative modes (`position_percent`, `from_end_seconds`) require known media duration.

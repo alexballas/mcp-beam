@@ -112,6 +112,7 @@ type fakeCastClient struct {
 	loadType            string
 	loadLive            bool
 	loadSubtitle        string
+	loadStartTime       int
 	seekSeconds         int
 	connectCalls        int
 	loadCalls           int
@@ -153,6 +154,7 @@ func (f *fakeCastClient) Load(mediaURL, contentType string, startTime int, durat
 	f.loadType = contentType
 	f.loadLive = live
 	f.loadSubtitle = subtitleURL
+	f.loadStartTime = startTime
 	if len(f.loadErrs) > 0 {
 		idx := f.loadCalls - 1
 		if idx >= len(f.loadErrs) {
@@ -218,7 +220,9 @@ type fakeDLNAFactory struct {
 	payloads []*fakeDLNAPayload
 	err      error
 
-	calls int
+	calls       int
+	lastOptions *soapcalls.Options
+	seenOptions []*soapcalls.Options
 }
 
 func (f *fakeDLNAFactory) NewTVPayload(o *soapcalls.Options) (adapters.DLNAPayload, error) {
@@ -244,6 +248,11 @@ func (f *fakeDLNAFactory) NewTVPayload(o *soapcalls.Options) (adapters.DLNAPaylo
 		p.rawPayload.CallbackURL = "http://" + p.listenAddr + "/cb-token"
 	}
 	f.calls++
+	if o != nil {
+		optCopy := *o
+		f.lastOptions = &optCopy
+		f.seenOptions = append(f.seenOptions, &optCopy)
+	}
 	return p, nil
 }
 
@@ -486,6 +495,220 @@ func TestBeamMediaFileAndStop(t *testing.T) {
 	}
 	if len(serverFactory.servers) == 0 || !serverFactory.servers[0].stopCalled {
 		t.Fatal("expected media server to be stopped")
+	}
+}
+
+func TestBeamMediaChromecastStartSecondsUsesLoadStartTime(t *testing.T) {
+	tmpDir := t.TempDir()
+	mediaPath := filepath.Join(tmpDir, "sample.mp4")
+	if err := os.WriteFile(mediaPath, []byte("not-real-media"), 0o600); err != nil {
+		t.Fatalf("write media file: %v", err)
+	}
+
+	discovery := &fakeDiscovery{devices: []domain.Device{{
+		ID:       "dev_start_cast",
+		Name:     "Living Room",
+		Address:  "http://127.0.0.1:8009",
+		Protocol: "chromecast",
+	}}}
+	castClient := &fakeCastClient{}
+	manager := NewManager(discovery, &fakeCastFactory{client: castClient}, nil)
+	defer manager.Close(context.Background())
+	manager.serverFactory = &fakeServerFactory{}
+	manager.listenAddressForDevice = func(deviceAddress string) (string, error) {
+		return "127.0.0.1:3500", nil
+	}
+
+	start := 42
+	result, err := manager.BeamMedia(context.Background(), domain.BeamRequest{
+		Source:       mediaPath,
+		TargetDevice: "dev_start_cast",
+		Transcode:    "never",
+		StartSeconds: &start,
+	})
+	if err != nil {
+		t.Fatalf("beam media: %v", err)
+	}
+	if !result.OK {
+		t.Fatal("expected beam result OK=true")
+	}
+	if castClient.loadStartTime != 42 {
+		t.Fatalf("expected Chromecast load start time 42, got %d", castClient.loadStartTime)
+	}
+}
+
+func TestBeamMediaAutoDetectSidecarSubtitlesChromecast(t *testing.T) {
+	tmpDir := t.TempDir()
+	mediaPath := filepath.Join(tmpDir, "movie.mp4")
+	subtitlesPath := filepath.Join(tmpDir, "movie.srt")
+	if err := os.WriteFile(mediaPath, []byte("not-real-media"), 0o600); err != nil {
+		t.Fatalf("write media file: %v", err)
+	}
+	if err := os.WriteFile(subtitlesPath, []byte("1\n00:00:00,000 --> 00:00:01,000\nHello\n"), 0o600); err != nil {
+		t.Fatalf("write subtitles file: %v", err)
+	}
+
+	discovery := &fakeDiscovery{devices: []domain.Device{{
+		ID:       "dev_subs_cast",
+		Name:     "Living Room",
+		Address:  "http://127.0.0.1:8009",
+		Protocol: "chromecast",
+	}}}
+	castClient := &fakeCastClient{}
+	manager := NewManager(discovery, &fakeCastFactory{client: castClient}, nil)
+	defer manager.Close(context.Background())
+	serverFactory := &fakeServerFactory{}
+	manager.serverFactory = serverFactory
+	manager.listenAddressForDevice = func(deviceAddress string) (string, error) {
+		return "127.0.0.1:3500", nil
+	}
+
+	result, err := manager.BeamMedia(context.Background(), domain.BeamRequest{
+		Source:       mediaPath,
+		TargetDevice: "dev_subs_cast",
+		Transcode:    "never",
+	})
+	if err != nil {
+		t.Fatalf("beam media: %v", err)
+	}
+	if !result.OK {
+		t.Fatal("expected beam result OK=true")
+	}
+	if castClient.loadSubtitle == "" {
+		t.Fatal("expected sidecar subtitle URL to be auto-detected")
+	}
+	if len(serverFactory.servers) != 1 {
+		t.Fatalf("expected one server, got %d", len(serverFactory.servers))
+	}
+	if serverFactory.servers[0].addCount != 2 {
+		t.Fatalf("expected media + subtitles handlers, got %d", serverFactory.servers[0].addCount)
+	}
+}
+
+func TestBeamMediaAutoDetectSidecarSubtitlesDLNA(t *testing.T) {
+	tmpDir := t.TempDir()
+	mediaPath := filepath.Join(tmpDir, "movie.mp4")
+	subtitlesPath := filepath.Join(tmpDir, "movie.vtt")
+	if err := os.WriteFile(mediaPath, []byte("not-real-media"), 0o600); err != nil {
+		t.Fatalf("write media file: %v", err)
+	}
+	if err := os.WriteFile(subtitlesPath, []byte("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n"), 0o600); err != nil {
+		t.Fatalf("write subtitles file: %v", err)
+	}
+
+	dlnaPayload := &fakeDLNAPayload{listenAddr: "127.0.0.1:3510"}
+	dlnaFactory := &fakeDLNAFactory{payloads: []*fakeDLNAPayload{dlnaPayload}}
+	manager := NewManager(&fakeDiscovery{devices: []domain.Device{{
+		ID:       "dlna_subs",
+		Name:     "DLNA TV",
+		Address:  "http://192.168.1.10:1400/device.xml",
+		Protocol: "dlna",
+	}}}, nil, dlnaFactory)
+	defer manager.Close(context.Background())
+	manager.serverFactory = &fakeServerFactory{}
+
+	result, err := manager.BeamMedia(context.Background(), domain.BeamRequest{
+		Source:       mediaPath,
+		TargetDevice: "dlna_subs",
+		Transcode:    "never",
+	})
+	if err != nil {
+		t.Fatalf("beam media: %v", err)
+	}
+	if !result.OK {
+		t.Fatal("expected beam result OK=true")
+	}
+	if dlnaFactory.lastOptions == nil {
+		t.Fatal("expected DLNA payload options to be captured")
+	}
+	if dlnaFactory.lastOptions.Subs != subtitlesPath {
+		t.Fatalf("expected auto-detected subtitles path %q, got %q", subtitlesPath, dlnaFactory.lastOptions.Subs)
+	}
+}
+
+func TestBeamMediaDLNAStartSecondsDirectSeeksAfterPlay(t *testing.T) {
+	tmpDir := t.TempDir()
+	mediaPath := filepath.Join(tmpDir, "movie.mp4")
+	if err := os.WriteFile(mediaPath, []byte("not-real-media"), 0o600); err != nil {
+		t.Fatalf("write media file: %v", err)
+	}
+
+	dlnaPayload := &fakeDLNAPayload{listenAddr: "127.0.0.1:3510"}
+	manager := NewManager(&fakeDiscovery{devices: []domain.Device{{
+		ID:       "dlna_start_direct",
+		Name:     "DLNA TV",
+		Address:  "http://192.168.1.10:1400/device.xml",
+		Protocol: "dlna",
+	}}}, nil, &fakeDLNAFactory{payloads: []*fakeDLNAPayload{dlnaPayload}})
+	defer manager.Close(context.Background())
+	manager.serverFactory = &fakeServerFactory{}
+
+	start := 30
+	result, err := manager.BeamMedia(context.Background(), domain.BeamRequest{
+		Source:       mediaPath,
+		TargetDevice: "dlna_start_direct",
+		Transcode:    "never",
+		StartSeconds: &start,
+	})
+	if err != nil {
+		t.Fatalf("beam media: %v", err)
+	}
+	if !result.OK {
+		t.Fatal("expected beam result OK=true")
+	}
+	if dlnaPayload.actionCount("Play1") != 1 {
+		t.Fatalf("expected Play1 once, got %d", dlnaPayload.actionCount("Play1"))
+	}
+	if dlnaPayload.seekRelTime != "00:00:30" {
+		t.Fatalf("expected start seek reltime 00:00:30, got %q", dlnaPayload.seekRelTime)
+	}
+}
+
+func TestBeamMediaDLNAStartSecondsTranscodingSetsFFmpegSeek(t *testing.T) {
+	tmpDir := t.TempDir()
+	mediaPath := filepath.Join(tmpDir, "movie.mp4")
+	if err := os.WriteFile(mediaPath, []byte("not-real-media"), 0o600); err != nil {
+		t.Fatalf("write media file: %v", err)
+	}
+
+	dlnaPayload := &fakeDLNAPayload{listenAddr: "127.0.0.1:3510"}
+	dlnaFactory := &fakeDLNAFactory{payloads: []*fakeDLNAPayload{dlnaPayload}}
+	manager := NewManager(&fakeDiscovery{devices: []domain.Device{{
+		ID:       "dlna_start_tc",
+		Name:     "DLNA TV",
+		Address:  "http://192.168.1.10:1400/device.xml",
+		Protocol: "dlna",
+	}}}, nil, dlnaFactory)
+	defer manager.Close(context.Background())
+	manager.serverFactory = &fakeServerFactory{}
+	manager.lookPath = func(file string) (string, error) {
+		if file == "ffmpeg" {
+			return "/usr/bin/ffmpeg", nil
+		}
+		return "", errors.New("not found")
+	}
+
+	start := 75
+	result, err := manager.BeamMedia(context.Background(), domain.BeamRequest{
+		Source:       mediaPath,
+		TargetDevice: "dlna_start_tc",
+		Transcode:    "always",
+		StartSeconds: &start,
+	})
+	if err != nil {
+		t.Fatalf("beam media: %v", err)
+	}
+	if !result.OK {
+		t.Fatal("expected beam result OK=true")
+	}
+	if dlnaFactory.lastOptions == nil {
+		t.Fatal("expected DLNA payload options to be captured")
+	}
+	if dlnaFactory.lastOptions.FFmpegSeek != 75 {
+		t.Fatalf("expected FFmpegSeek=75, got %d", dlnaFactory.lastOptions.FFmpegSeek)
+	}
+	if dlnaPayload.seekRelTime != "" {
+		t.Fatalf("expected no direct seek for transcoded start, got %q", dlnaPayload.seekRelTime)
 	}
 }
 
@@ -786,6 +1009,96 @@ func TestSeekBeamingDLNAFromEnd(t *testing.T) {
 	}
 	if result.DurationSeconds == nil || *result.DurationSeconds != 180 {
 		t.Fatalf("expected duration_seconds 180, got %#v", result.DurationSeconds)
+	}
+}
+
+func TestSeekBeamingChromecastDeltaBySessionID(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	defer manager.Close(context.Background())
+
+	castClient := &fakeCastClient{
+		statuses: []castprotocol.CastStatus{
+			{PlayerState: "PLAYING", CurrentTime: 120, Duration: 300},
+		},
+	}
+	sess := &session{
+		ID:         "sess_seek_delta",
+		DeviceID:   "dev_cast",
+		DeviceName: "Living Room",
+		Protocol:   "chromecast",
+		castClient: castClient,
+	}
+	manager.initializeSessionLifecycle(sess, "playing", "120")
+	if _, stored := manager.storeSession(sess); !stored {
+		t.Fatal("expected session to be stored")
+	}
+
+	delta := -15
+	result, err := manager.SeekBeaming(context.Background(), domain.SeekRequest{
+		SessionID:    "sess_seek_delta",
+		DeltaSeconds: &delta,
+	})
+	if err != nil {
+		t.Fatalf("seek beaming: %v", err)
+	}
+	if castClient.seekSeconds != 105 {
+		t.Fatalf("expected seek position 105, got %d", castClient.seekSeconds)
+	}
+	if result.RequestedMode != "delta_seconds" {
+		t.Fatalf("expected requested_mode delta_seconds, got %s", result.RequestedMode)
+	}
+	if result.ResolvedPositionSeconds != 105 {
+		t.Fatalf("expected resolved_position_seconds 105, got %d", result.ResolvedPositionSeconds)
+	}
+	if result.DurationSeconds == nil || *result.DurationSeconds != 300 {
+		t.Fatalf("expected duration_seconds 300, got %#v", result.DurationSeconds)
+	}
+}
+
+func TestSeekBeamingDeltaClampsBounds(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	defer manager.Close(context.Background())
+
+	castClient := &fakeCastClient{
+		statuses: []castprotocol.CastStatus{
+			{PlayerState: "PLAYING", CurrentTime: 5, Duration: 100},
+			{PlayerState: "PLAYING", CurrentTime: 95, Duration: 100},
+		},
+	}
+	sess := &session{
+		ID:         "sess_seek_delta_bounds",
+		DeviceID:   "dev_cast",
+		DeviceName: "Living Room",
+		Protocol:   "chromecast",
+		castClient: castClient,
+	}
+	manager.initializeSessionLifecycle(sess, "playing", "5")
+	if _, stored := manager.storeSession(sess); !stored {
+		t.Fatal("expected session to be stored")
+	}
+
+	rewind := -20
+	resultLow, err := manager.SeekBeaming(context.Background(), domain.SeekRequest{
+		SessionID:    "sess_seek_delta_bounds",
+		DeltaSeconds: &rewind,
+	})
+	if err != nil {
+		t.Fatalf("seek beaming low clamp: %v", err)
+	}
+	if resultLow.ResolvedPositionSeconds != 0 {
+		t.Fatalf("expected resolved low clamp to 0, got %d", resultLow.ResolvedPositionSeconds)
+	}
+
+	skip := 20
+	resultHigh, err := manager.SeekBeaming(context.Background(), domain.SeekRequest{
+		SessionID:    "sess_seek_delta_bounds",
+		DeltaSeconds: &skip,
+	})
+	if err != nil {
+		t.Fatalf("seek beaming high clamp: %v", err)
+	}
+	if resultHigh.ResolvedPositionSeconds != 100 {
+		t.Fatalf("expected resolved high clamp to 100, got %d", resultHigh.ResolvedPositionSeconds)
 	}
 }
 

@@ -508,6 +508,7 @@ func TestToolsCallBeamMedia(t *testing.T) {
 				"source":        "/tmp/video.mp4",
 				"target_device": "dev_1",
 				"transcode":     "never",
+				"start_seconds": 42,
 			},
 		},
 	})
@@ -535,6 +536,42 @@ func TestToolsCallBeamMedia(t *testing.T) {
 	}
 	if controller.beamReq.Transcode != "never" {
 		t.Fatalf("unexpected transcode forwarded: %s", controller.beamReq.Transcode)
+	}
+	if controller.beamReq.StartSeconds == nil || *controller.beamReq.StartSeconds != 42 {
+		t.Fatalf("unexpected start_seconds forwarded: %#v", controller.beamReq.StartSeconds)
+	}
+}
+
+func TestToolsCallBeamMediaInvalidStartSeconds(t *testing.T) {
+	input := bytes.NewBuffer(nil)
+	output := bytes.NewBuffer(nil)
+
+	writeRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      85,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name": "beam_media",
+			"arguments": map[string]any{
+				"source":        "/tmp/video.mp4",
+				"target_device": "dev_1",
+				"start_seconds": -2,
+			},
+		},
+	})
+
+	srv := New(input, output, Config{BeamController: &fakeBeamController{}})
+	if err := srv.Run(context.Background()); err != nil {
+		t.Fatalf("run server: %v", err)
+	}
+
+	responses := readResponses(t, output.Bytes())
+	if len(responses) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(responses))
+	}
+	errObj := responses[0]["error"].(map[string]any)
+	if errObj["code"].(float64) != -32602 {
+		t.Fatalf("expected -32602, got %v", errObj["code"])
 	}
 }
 
@@ -1037,6 +1074,50 @@ func TestToolsCallSeekBeamingFromEnd(t *testing.T) {
 	}
 	if controller.seekReq.PositionSeconds != nil || controller.seekReq.PositionPercent != nil {
 		t.Fatalf("expected only from_end seek mode, got %+v", controller.seekReq)
+	}
+}
+
+func TestToolsCallSeekBeamingDelta(t *testing.T) {
+	input := bytes.NewBuffer(nil)
+	output := bytes.NewBuffer(nil)
+	controller := &fakeBeamController{
+		seekResult: &domain.SeekResult{
+			OK:                      true,
+			SessionID:               "sess_seek_delta",
+			DeviceID:                "dev_1",
+			PositionSeconds:         90,
+			RequestedMode:           "delta_seconds",
+			ResolvedPositionSeconds: 90,
+		},
+	}
+
+	writeRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      86,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name": "seek_beaming",
+			"arguments": map[string]any{
+				"session_id":    "sess_seek_delta",
+				"delta_seconds": -10,
+			},
+		},
+	})
+
+	srv := New(input, output, Config{BeamController: controller})
+	if err := srv.Run(context.Background()); err != nil {
+		t.Fatalf("run server: %v", err)
+	}
+
+	responses := readResponses(t, output.Bytes())
+	if len(responses) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(responses))
+	}
+	if controller.seekReq.DeltaSeconds == nil || *controller.seekReq.DeltaSeconds != -10 {
+		t.Fatalf("unexpected seek request delta_seconds: %#v", controller.seekReq.DeltaSeconds)
+	}
+	if controller.seekReq.PositionSeconds != nil || controller.seekReq.PositionPercent != nil || controller.seekReq.FromEndSeconds != nil {
+		t.Fatalf("expected only delta seek mode, got %+v", controller.seekReq)
 	}
 }
 

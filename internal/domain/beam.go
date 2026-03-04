@@ -5,6 +5,7 @@ type BeamRequest struct {
 	TargetDevice  string `json:"target_device"`
 	Transcode     string `json:"transcode,omitempty"`
 	SubtitlesPath string `json:"subtitles_path,omitempty"`
+	StartSeconds  *int   `json:"start_seconds,omitempty"`
 }
 
 type BeamResult struct {
@@ -33,6 +34,7 @@ type SeekRequest struct {
 	PositionSeconds *int     `json:"position_seconds,omitempty"`
 	PositionPercent *float64 `json:"position_percent,omitempty"`
 	FromEndSeconds  *int     `json:"from_end_seconds,omitempty"`
+	DeltaSeconds    *int     `json:"delta_seconds,omitempty"`
 }
 
 type SeekResult struct {
