@@ -1091,6 +1091,101 @@ func TestBeamMediaChromecastOperationTimeout(t *testing.T) {
 	}
 }
 
+func TestBeamMediaChromecastLoadDeadlineGraceAllowsLateSuccess(t *testing.T) {
+	tmpDir := t.TempDir()
+	mediaPath := filepath.Join(tmpDir, "sample.mp4")
+	if err := os.WriteFile(mediaPath, []byte("not-real-media"), 0o600); err != nil {
+		t.Fatalf("write media file: %v", err)
+	}
+
+	discovery := &fakeDiscovery{devices: []domain.Device{{
+		ID:       "dev_load_grace",
+		Name:     "Grace TV",
+		Address:  "http://127.0.0.1:8009",
+		Protocol: "chromecast",
+	}}}
+	castClient := &fakeCastClient{loadDelay: 120 * time.Millisecond}
+	manager := NewManager(discovery, &fakeCastFactory{client: castClient}, nil)
+	defer manager.Close(context.Background())
+	manager.serverFactory = &fakeServerFactory{}
+	manager.listenAddressForDevice = func(deviceAddress string) (string, error) {
+		return "127.0.0.1:3564", nil
+	}
+	manager.retryAttempts = 1
+	manager.beamOperationTimeout = 40 * time.Millisecond
+	manager.chromecastLoadDeadlineGrace = 300 * time.Millisecond
+
+	started := time.Now()
+	result, err := manager.BeamMedia(context.Background(), domain.BeamRequest{
+		Source:       mediaPath,
+		TargetDevice: "dev_load_grace",
+		Transcode:    "never",
+	})
+	elapsed := time.Since(started)
+	if err != nil {
+		t.Fatalf("beam media: %v", err)
+	}
+	if !result.OK {
+		t.Fatal("expected OK result")
+	}
+	if elapsed < 100*time.Millisecond {
+		t.Fatalf("expected to wait for delayed load completion, elapsed=%s", elapsed)
+	}
+	if elapsed > 650*time.Millisecond {
+		t.Fatalf("expected load completion within grace window, elapsed=%s", elapsed)
+	}
+}
+
+func TestBeamMediaChromecastLoadDeadlineGraceStillTimesOut(t *testing.T) {
+	tmpDir := t.TempDir()
+	mediaPath := filepath.Join(tmpDir, "sample.mp4")
+	if err := os.WriteFile(mediaPath, []byte("not-real-media"), 0o600); err != nil {
+		t.Fatalf("write media file: %v", err)
+	}
+
+	discovery := &fakeDiscovery{devices: []domain.Device{{
+		ID:       "dev_load_timeout",
+		Name:     "Timeout Load TV",
+		Address:  "http://127.0.0.1:8009",
+		Protocol: "chromecast",
+	}}}
+	castClient := &fakeCastClient{loadDelay: 400 * time.Millisecond}
+	manager := NewManager(discovery, &fakeCastFactory{client: castClient}, nil)
+	defer manager.Close(context.Background())
+	manager.serverFactory = &fakeServerFactory{}
+	manager.listenAddressForDevice = func(deviceAddress string) (string, error) {
+		return "127.0.0.1:3565", nil
+	}
+	manager.retryAttempts = 1
+	manager.beamOperationTimeout = 40 * time.Millisecond
+	manager.chromecastLoadDeadlineGrace = 90 * time.Millisecond
+
+	started := time.Now()
+	_, err := manager.BeamMedia(context.Background(), domain.BeamRequest{
+		Source:       mediaPath,
+		TargetDevice: "dev_load_timeout",
+		Transcode:    "never",
+	})
+	elapsed := time.Since(started)
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if elapsed > 300*time.Millisecond {
+		t.Fatalf("expected timeout after grace window, elapsed=%s", elapsed)
+	}
+
+	toolErr, ok := err.(*domain.ToolError)
+	if !ok {
+		t.Fatalf("expected ToolError, got %T", err)
+	}
+	if toolErr.Code != "PROTOCOL_ERROR" {
+		t.Fatalf("expected PROTOCOL_ERROR, got %s", toolErr.Code)
+	}
+	if !strings.Contains(strings.ToLower(toolErr.Message), "context deadline exceeded") {
+		t.Fatalf("expected context deadline message, got %q", toolErr.Message)
+	}
+}
+
 func TestBeamMediaDLNAOperationTimeout(t *testing.T) {
 	tmpDir := t.TempDir()
 	mediaPath := filepath.Join(tmpDir, "sample.mp4")
