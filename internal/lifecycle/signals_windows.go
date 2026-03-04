@@ -4,6 +4,9 @@ package lifecycle
 
 import "os"
 
-func TerminationSignals() []os.Signal {
-	return []os.Signal{os.Interrupt}
+func TerminationSignals(includeInterrupt bool) []os.Signal {
+	if includeInterrupt {
+		return []os.Signal{os.Interrupt}
+	}
+	return []os.Signal{}
 }

@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"go2tv.app/mcp-beam/internal/domain"
@@ -22,6 +23,7 @@ const (
 	transcodeAuto             = "auto"
 	transcodeAlways           = "always"
 	transcodeNever            = "never"
+	inflightDrainTimeout      = 2 * time.Second
 )
 
 type LocalHardwareLister interface {
@@ -45,6 +47,8 @@ type Server struct {
 	tools               []tool
 	localHardwareLister LocalHardwareLister
 	beamController      BeamController
+	sendMu              sync.Mutex
+	inflightTools       sync.WaitGroup
 }
 
 type Config struct {
@@ -88,6 +92,7 @@ func (s *Server) Run(ctx context.Context) error {
 		payload, jsonLineInput, err := readMessage(s.in)
 		if err != nil {
 			if err == io.EOF {
+				s.waitForInflightTools()
 				s.logLifecycle(slog.LevelInfo, "mcp_stream_eof")
 				return nil
 			}
@@ -163,7 +168,16 @@ func (s *Server) handle(ctx context.Context, payload []byte) error {
 		s.logCall("tools/list", "", "", startedAt, "")
 		return s.send(response{JSONRPC: "2.0", ID: req.ID, Result: toolsListResult{Tools: s.tools}})
 	case "tools/call":
-		return s.handleToolCall(ctx, req.ID, req.Params)
+		toolID := append(json.RawMessage(nil), req.ID...)
+		toolParams := append(json.RawMessage(nil), req.Params...)
+		s.inflightTools.Add(1)
+		go func(callID, rawParams json.RawMessage) {
+			defer s.inflightTools.Done()
+			if err := s.handleToolCall(ctx, callID, rawParams); err != nil {
+				s.logLifecycle(slog.LevelError, "mcp_tool_call_error", slog.String("error", err.Error()))
+			}
+		}(toolID, toolParams)
+		return nil
 	default:
 		s.logCall(req.Method, "", "", startedAt, "-32601")
 		return s.send(response{
@@ -643,6 +657,9 @@ func (s *Server) logCall(method, deviceID, sessionID string, startedAt time.Time
 }
 
 func (s *Server) send(resp response) error {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+
 	encoded, err := json.Marshal(resp)
 	if err != nil {
 		return err
@@ -652,6 +669,27 @@ func (s *Server) send(resp response) error {
 		return writeJSONLineMessage(s.out, encoded)
 	}
 	return writeFramedMessage(s.out, encoded)
+}
+
+func (s *Server) waitForInflightTools() {
+	done := make(chan struct{})
+	go func() {
+		s.inflightTools.Wait()
+		close(done)
+	}()
+
+	timer := time.NewTimer(inflightDrainTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-done:
+	case <-timer.C:
+		s.logLifecycle(
+			slog.LevelWarn,
+			"mcp_inflight_drain_timeout",
+			slog.Int64("waited_ms", inflightDrainTimeout.Milliseconds()),
+		)
+	}
 }
 
 func (s *Server) logLifecycle(level slog.Level, msg string, attrs ...any) {

@@ -97,8 +97,10 @@ type fakeCastClient struct {
 	deviceAddr   string
 	connectErr   error
 	connectErrs  []error
+	connectDelay time.Duration
 	loadErr      error
 	loadErrs     []error
+	loadDelay    time.Duration
 	seekErr      error
 	stopErr      error
 	closeErr     error
@@ -120,6 +122,9 @@ type fakeCastClient struct {
 }
 
 func (f *fakeCastClient) Connect() error {
+	if f.connectDelay > 0 {
+		time.Sleep(f.connectDelay)
+	}
 	f.connectCalls++
 	if len(f.connectErrs) > 0 {
 		idx := f.connectCalls - 1
@@ -134,6 +139,9 @@ func (f *fakeCastClient) Connect() error {
 }
 
 func (f *fakeCastClient) Load(mediaURL, contentType string, startTime int, duration float64, subtitleURL string, live bool) error {
+	if f.loadDelay > 0 {
+		time.Sleep(f.loadDelay)
+	}
 	f.loadCalls++
 	f.loadURL = mediaURL
 	f.loadType = contentType
@@ -236,14 +244,29 @@ type fakeDLNAPayload struct {
 	seekRelTime        string
 
 	setContextCalls int
+	ctx             context.Context
+
+	blockPlayUntilContextDone bool
 }
 
 func (f *fakeDLNAPayload) SendtoTV(action string) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.actions = append(f.actions, action)
-	if f.actionErr != nil {
-		if err, ok := f.actionErr[action]; ok {
+	ctx := f.ctx
+	block := f.blockPlayUntilContextDone && action == "Play1"
+	actionErr := f.actionErr
+	f.mu.Unlock()
+
+	if block {
+		if ctx == nil {
+			return errors.New("missing payload context")
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	if actionErr != nil {
+		if err, ok := actionErr[action]; ok {
 			return err
 		}
 	}
@@ -291,6 +314,7 @@ func (f *fakeDLNAPayload) SetContext(ctx context.Context) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.setContextCalls++
+	f.ctx = ctx
 }
 
 func (f *fakeDLNAPayload) MediaURL() string {
@@ -1018,6 +1042,102 @@ func TestBeamMediaRetryExhaustionReturnsDeterministicError(t *testing.T) {
 	}
 }
 
+func TestBeamMediaChromecastOperationTimeout(t *testing.T) {
+	tmpDir := t.TempDir()
+	mediaPath := filepath.Join(tmpDir, "sample.mp4")
+	if err := os.WriteFile(mediaPath, []byte("not-real-media"), 0o600); err != nil {
+		t.Fatalf("write media file: %v", err)
+	}
+
+	discovery := &fakeDiscovery{devices: []domain.Device{{
+		ID:       "dev_timeout_cast",
+		Name:     "Timeout TV",
+		Address:  "http://127.0.0.1:8009",
+		Protocol: "chromecast",
+	}}}
+	castClient := &fakeCastClient{connectDelay: 300 * time.Millisecond}
+	manager := NewManager(discovery, &fakeCastFactory{client: castClient}, nil)
+	defer manager.Close(context.Background())
+	manager.serverFactory = &fakeServerFactory{}
+	manager.listenAddressForDevice = func(deviceAddress string) (string, error) {
+		return "127.0.0.1:3562", nil
+	}
+	manager.retryAttempts = 1
+	manager.beamOperationTimeout = 40 * time.Millisecond
+
+	started := time.Now()
+	_, err := manager.BeamMedia(context.Background(), domain.BeamRequest{
+		Source:       mediaPath,
+		TargetDevice: "dev_timeout_cast",
+		Transcode:    "never",
+	})
+	elapsed := time.Since(started)
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("expected timeout to fail fast, elapsed=%s", elapsed)
+	}
+
+	toolErr, ok := err.(*domain.ToolError)
+	if !ok {
+		t.Fatalf("expected ToolError, got %T", err)
+	}
+	if toolErr.Code != "DEVICE_UNREACHABLE" {
+		t.Fatalf("expected DEVICE_UNREACHABLE, got %s", toolErr.Code)
+	}
+	if !strings.Contains(strings.ToLower(toolErr.Message), "context deadline exceeded") {
+		t.Fatalf("expected context deadline message, got %q", toolErr.Message)
+	}
+}
+
+func TestBeamMediaDLNAOperationTimeout(t *testing.T) {
+	tmpDir := t.TempDir()
+	mediaPath := filepath.Join(tmpDir, "sample.mp4")
+	if err := os.WriteFile(mediaPath, []byte("not-real-media"), 0o600); err != nil {
+		t.Fatalf("write media file: %v", err)
+	}
+
+	payload := &fakeDLNAPayload{
+		listenAddr:                "127.0.0.1:3563",
+		blockPlayUntilContextDone: true,
+	}
+	manager := NewManager(&fakeDiscovery{devices: []domain.Device{{
+		ID:       "dlna_timeout",
+		Name:     "Timeout DLNA",
+		Address:  "http://192.168.1.13:1400/device.xml",
+		Protocol: "dlna",
+	}}}, nil, &fakeDLNAFactory{payloads: []*fakeDLNAPayload{payload}})
+	defer manager.Close(context.Background())
+	manager.serverFactory = &fakeServerFactory{}
+	manager.beamOperationTimeout = 40 * time.Millisecond
+
+	started := time.Now()
+	_, err := manager.BeamMedia(context.Background(), domain.BeamRequest{
+		Source:       mediaPath,
+		TargetDevice: "dlna_timeout",
+		Transcode:    "never",
+	})
+	elapsed := time.Since(started)
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if elapsed > 250*time.Millisecond {
+		t.Fatalf("expected timeout to fail fast, elapsed=%s", elapsed)
+	}
+
+	toolErr, ok := err.(*domain.ToolError)
+	if !ok {
+		t.Fatalf("expected ToolError, got %T", err)
+	}
+	if toolErr.Code != "PROTOCOL_ERROR" {
+		t.Fatalf("expected PROTOCOL_ERROR, got %s", toolErr.Code)
+	}
+	if !strings.Contains(strings.ToLower(toolErr.Message), "context deadline exceeded") {
+		t.Fatalf("expected context deadline message, got %q", toolErr.Message)
+	}
+}
+
 func TestBeamMediaRejectsLoopbackURLByDefault(t *testing.T) {
 	discovery := &fakeDiscovery{devices: []domain.Device{{
 		ID:       "dev_loopback",
@@ -1269,6 +1389,56 @@ func TestBeamMediaDLNAURLDirectThenProxyFallback(t *testing.T) {
 	}
 	if !result.OK {
 		t.Fatal("expected OK result")
+	}
+	if factory.calls != 2 {
+		t.Fatalf("expected two payload attempts (direct + proxy), got %d", factory.calls)
+	}
+	if direct.actionCount("Play1") != 1 {
+		t.Fatalf("expected direct Play1 once, got %d", direct.actionCount("Play1"))
+	}
+	if proxy.actionCount("Play1") != 1 {
+		t.Fatalf("expected proxy Play1 once, got %d", proxy.actionCount("Play1"))
+	}
+	if !containsWarning(result.Warnings, "falling back") {
+		t.Fatalf("expected fallback warning, got %v", result.Warnings)
+	}
+}
+
+func TestBeamMediaDLNAURLDirectAttemptTimeoutFallsBack(t *testing.T) {
+	direct := &fakeDLNAPayload{
+		listenAddr:                "127.0.0.1:3522",
+		blockPlayUntilContextDone: true,
+	}
+	proxy := &fakeDLNAPayload{listenAddr: "127.0.0.1:3523"}
+	factory := &fakeDLNAFactory{payloads: []*fakeDLNAPayload{direct, proxy}}
+
+	manager := NewManager(&fakeDiscovery{devices: []domain.Device{{
+		ID:       "dlna_1",
+		Name:     "Bedroom TV",
+		Address:  "http://192.168.1.12:1400/device.xml",
+		Protocol: "dlna",
+	}}}, nil, factory)
+	defer manager.Close(context.Background())
+	manager.serverFactory = &fakeServerFactory{}
+	manager.prepareURLMedia = func(ctx context.Context, sourceURL string) (any, string, error) {
+		return io.NopCloser(strings.NewReader("video-bytes")), "video/mp4", nil
+	}
+	manager.dlnaDirectURLAttemptTimeout = 25 * time.Millisecond
+
+	startedAt := time.Now()
+	result, err := manager.BeamMedia(context.Background(), domain.BeamRequest{
+		Source:       "https://example.com/video.mp4",
+		TargetDevice: "dlna_1",
+		Transcode:    "auto",
+	})
+	if err != nil {
+		t.Fatalf("beam media: %v", err)
+	}
+	if !result.OK {
+		t.Fatal("expected OK result")
+	}
+	if time.Since(startedAt) > 750*time.Millisecond {
+		t.Fatalf("expected fast fallback after direct timeout, elapsed=%s", time.Since(startedAt))
 	}
 	if factory.calls != 2 {
 		t.Fatalf("expected two payload attempts (direct + proxy), got %d", factory.calls)

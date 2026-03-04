@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"time"
 
@@ -66,7 +67,21 @@ func main() {
 		return
 	}
 
-	runCtx, stopSignals := signal.NotifyContext(context.Background(), lifecycle.TerminationSignals()...)
+	handleSIGINT := boolEnv("MCP_BEAM_HANDLE_SIGINT", false)
+	if !handleSIGINT {
+		signal.Ignore(os.Interrupt)
+		defer signal.Reset(os.Interrupt)
+	}
+	termSignals := lifecycle.TerminationSignals(handleSIGINT)
+	var (
+		runCtx      context.Context
+		stopSignals context.CancelFunc
+	)
+	if len(termSignals) == 0 {
+		runCtx, stopSignals = context.WithCancel(context.Background())
+	} else {
+		runCtx, stopSignals = signal.NotifyContext(context.Background(), termSignals...)
+	}
 	defer stopSignals()
 
 	logLevel := parseLogLevel(os.Getenv("MCP_BEAM_LOG_LEVEL"))
@@ -133,4 +148,16 @@ func parseLogLevel(raw string) slog.Level {
 		fmt.Fprintf(os.Stderr, "invalid MCP_BEAM_LOG_LEVEL=%q; defaulting to info\n", raw)
 		return slog.LevelInfo
 	}
+}
+
+func boolEnv(name string, defaultValue bool) bool {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return defaultValue
+	}
+	parsed, err := strconv.ParseBool(raw)
+	if err != nil {
+		return defaultValue
+	}
+	return parsed
 }

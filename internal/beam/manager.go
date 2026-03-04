@@ -48,6 +48,9 @@ const (
 	defaultRetryBaseBackoff = 120 * time.Millisecond
 	defaultRetryMaxBackoff  = 800 * time.Millisecond
 
+	defaultBeamOperationTimeout        = 12 * time.Second
+	defaultDLNADirectURLAttemptTimeout = 4 * time.Second
+
 	seekModeAbsoluteSeconds = "absolute_seconds"
 	seekModePercent         = "percent"
 	seekModeFromEndSeconds  = "from_end_seconds"
@@ -99,6 +102,9 @@ type Manager struct {
 	retryAttempts    int
 	retryBaseBackoff time.Duration
 	retryMaxBackoff  time.Duration
+
+	beamOperationTimeout        time.Duration
+	dlnaDirectURLAttemptTimeout time.Duration
 
 	cleanupLoopCancel context.CancelFunc
 	cleanupLoopDone   chan struct{}
@@ -171,30 +177,32 @@ func NewManager(discovery deviceLister, castFactory adapters.CastFactory, dlnaFa
 	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
 	allowedPathPrefixes := parseAllowedPathPrefixes(os.Getenv("MCP_BEAM_ALLOWED_PATH_PREFIXES"))
 	manager := &Manager{
-		discovery:              discovery,
-		castFactory:            castFactory,
-		dlnaFactory:            dlnaFactory,
-		serverFactory:          go2TVStreamServerFactory{},
-		lookPath:               exec.LookPath,
-		listenAddressForDevice: utils.URLtoListenIPandPort,
-		prepareURLMedia:        utils.PrepareURLMedia,
-		dlnaPollEvery:          dlnaPollInterval,
-		idleCleanupAfter:       defaultIdleCleanupAfter,
-		pausedCleanupAfter:     defaultPausedCleanupAfter,
-		maxSessionAge:          defaultMaxSessionAge,
-		cleanupSweepEvery:      defaultCleanupSweepEvery,
-		now:                    time.Now,
-		strictPathPolicy:       boolEnv("MCP_BEAM_STRICT_PATH_POLICY", false),
-		allowedPathPrefixes:    allowedPathPrefixes,
-		allowLoopbackURLs:      boolEnv("MCP_BEAM_ALLOW_LOOPBACK_URLS", false),
-		allowWildcardBind:      boolEnv("MCP_BEAM_ALLOW_WILDCARD_BIND", false),
-		retryAttempts:          defaultRetryAttempts,
-		retryBaseBackoff:       defaultRetryBaseBackoff,
-		retryMaxBackoff:        defaultRetryMaxBackoff,
-		cleanupLoopCancel:      cleanupCancel,
-		cleanupLoopDone:        make(chan struct{}),
-		sessionsByID:           map[string]*session{},
-		sessionByDeviceID:      map[string]string{},
+		discovery:                   discovery,
+		castFactory:                 castFactory,
+		dlnaFactory:                 dlnaFactory,
+		serverFactory:               go2TVStreamServerFactory{},
+		lookPath:                    exec.LookPath,
+		listenAddressForDevice:      utils.URLtoListenIPandPort,
+		prepareURLMedia:             utils.PrepareURLMedia,
+		dlnaPollEvery:               dlnaPollInterval,
+		idleCleanupAfter:            defaultIdleCleanupAfter,
+		pausedCleanupAfter:          defaultPausedCleanupAfter,
+		maxSessionAge:               defaultMaxSessionAge,
+		cleanupSweepEvery:           defaultCleanupSweepEvery,
+		now:                         time.Now,
+		strictPathPolicy:            boolEnv("MCP_BEAM_STRICT_PATH_POLICY", false),
+		allowedPathPrefixes:         allowedPathPrefixes,
+		allowLoopbackURLs:           boolEnv("MCP_BEAM_ALLOW_LOOPBACK_URLS", false),
+		allowWildcardBind:           boolEnv("MCP_BEAM_ALLOW_WILDCARD_BIND", false),
+		retryAttempts:               defaultRetryAttempts,
+		retryBaseBackoff:            defaultRetryBaseBackoff,
+		retryMaxBackoff:             defaultRetryMaxBackoff,
+		beamOperationTimeout:        defaultBeamOperationTimeout,
+		dlnaDirectURLAttemptTimeout: defaultDLNADirectURLAttemptTimeout,
+		cleanupLoopCancel:           cleanupCancel,
+		cleanupLoopDone:             make(chan struct{}),
+		sessionsByID:                map[string]*session{},
+		sessionByDeviceID:           map[string]string{},
 	}
 	go manager.runCleanupLoop(cleanupCtx)
 	return manager
@@ -208,21 +216,28 @@ func (m *Manager) BeamMedia(ctx context.Context, req domain.BeamRequest) (*domai
 		return nil, toolError("INTERNAL_ERROR", "beam manager is shutting down")
 	}
 
+	beamCtx := ctx
+	cancel := func() {}
+	if m.beamOperationTimeout > 0 {
+		beamCtx, cancel = context.WithTimeout(ctx, m.beamOperationTimeout)
+	}
+	defer cancel()
+
 	mode := normalizeTranscodeMode(req.Transcode)
 	if mode == "" {
 		return nil, toolError("INTERNAL_ERROR", "invalid transcode mode")
 	}
 
-	device, err := m.resolveDevice(ctx, req.TargetDevice)
+	device, err := m.resolveDevice(beamCtx, req.TargetDevice)
 	if err != nil {
 		return nil, err
 	}
 
 	switch device.Protocol {
 	case "chromecast":
-		return m.beamChromecast(ctx, req, device, mode)
+		return m.beamChromecast(beamCtx, req, device, mode)
 	case "dlna":
-		return m.beamDLNA(ctx, req, device, mode)
+		return m.beamDLNA(beamCtx, req, device, mode)
 	default:
 		return nil, unsupportedProtocolError(device.Protocol)
 	}
@@ -748,8 +763,15 @@ func (m *Manager) prepareDLNAURLPlayback(ctx context.Context, req domain.BeamReq
 
 	warnings := []string{}
 	if mode != transcodeAlways {
+		directCtx := ctx
+		directCancel := func() {}
+		if m.dlnaDirectURLAttemptTimeout > 0 {
+			directCtx, directCancel = context.WithTimeout(ctx, m.dlnaDirectURLAttemptTimeout)
+		}
+		defer directCancel()
+
 		directType := detectURLMediaType(sourceURL)
-		direct, directErr := m.startDLNAServerAndPlay(ctx, device, []byte("dlna-direct-url-placeholder"), directType, sourceURL, subtitlesPath, false, "", sourceURL)
+		direct, directErr := m.startDLNAServerAndPlay(directCtx, device, []byte("dlna-direct-url-placeholder"), directType, sourceURL, subtitlesPath, false, "", sourceURL)
 		if directErr == nil {
 			direct.warnings = append(direct.warnings, warnings...)
 			return direct, nil
@@ -1098,11 +1120,14 @@ func (m *Manager) withRetry(ctx context.Context, call func() error) error {
 
 	var lastErr error
 	for attempt := 1; attempt <= attempts; attempt++ {
-		err := call()
+		err := runCallWithContext(ctx, call)
 		if err == nil {
 			return nil
 		}
 		lastErr = err
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
 		if attempt >= attempts || !isTransientNetworkError(err) {
 			break
 		}
@@ -1113,6 +1138,24 @@ func (m *Manager) withRetry(ctx context.Context, call func() error) error {
 		}
 	}
 	return lastErr
+}
+
+func runCallWithContext(ctx context.Context, call func() error) error {
+	if ctx == nil {
+		return call()
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- call()
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func backoffForAttempt(base, max time.Duration, attempt int) time.Duration {

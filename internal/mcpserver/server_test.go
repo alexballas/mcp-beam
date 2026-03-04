@@ -11,7 +11,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"go2tv.app/mcp-beam/internal/domain"
 )
@@ -21,9 +23,12 @@ type fakeLocalHardwareLister struct {
 	includeUnreachable bool
 	devices            []domain.Device
 	err                error
+	called             chan struct{}
+	calledOnce         sync.Once
 }
 
 type fakeBeamController struct {
+	mu         sync.Mutex
 	beamReq    domain.BeamRequest
 	beamResult *domain.BeamResult
 	beamErr    error
@@ -33,26 +38,44 @@ type fakeBeamController struct {
 	seekReq    domain.SeekRequest
 	seekResult *domain.SeekResult
 	seekErr    error
+	beamBlock  <-chan struct{}
+	beamCalled chan struct{}
+	beamOnce   sync.Once
 }
 
 func (f *fakeBeamController) BeamMedia(ctx context.Context, req domain.BeamRequest) (*domain.BeamResult, error) {
+	f.mu.Lock()
 	f.beamReq = req
+	f.mu.Unlock()
+	if f.beamCalled != nil {
+		f.beamOnce.Do(func() { close(f.beamCalled) })
+	}
+	if f.beamBlock != nil {
+		<-f.beamBlock
+	}
 	return f.beamResult, f.beamErr
 }
 
 func (f *fakeBeamController) StopBeaming(ctx context.Context, req domain.StopRequest) (*domain.StopResult, error) {
+	f.mu.Lock()
 	f.stopReq = req
+	f.mu.Unlock()
 	return f.stopResult, f.stopErr
 }
 
 func (f *fakeBeamController) SeekBeaming(ctx context.Context, req domain.SeekRequest) (*domain.SeekResult, error) {
+	f.mu.Lock()
 	f.seekReq = req
+	f.mu.Unlock()
 	return f.seekResult, f.seekErr
 }
 
 func (f *fakeLocalHardwareLister) ListLocalHardware(ctx context.Context, timeoutMS int, includeUnreachable bool) ([]domain.Device, error) {
 	f.timeoutMS = timeoutMS
 	f.includeUnreachable = includeUnreachable
+	if f.called != nil {
+		f.calledOnce.Do(func() { close(f.called) })
+	}
 	return f.devices, f.err
 }
 
@@ -478,6 +501,104 @@ func TestToolsCallBeamMedia(t *testing.T) {
 	}
 	if controller.beamReq.Transcode != "never" {
 		t.Fatalf("unexpected transcode forwarded: %s", controller.beamReq.Transcode)
+	}
+}
+
+func TestToolsCallCanRunConcurrently(t *testing.T) {
+	input := bytes.NewBuffer(nil)
+	output := bytes.NewBuffer(nil)
+	releaseBeam := make(chan struct{})
+	beamCalled := make(chan struct{})
+	listCalled := make(chan struct{})
+
+	controller := &fakeBeamController{
+		beamResult: &domain.BeamResult{
+			OK:          true,
+			SessionID:   "sess_slow",
+			DeviceID:    "dev_slow",
+			MediaURL:    "http://127.0.0.1:3500/media",
+			Transcoding: false,
+		},
+		beamBlock:  releaseBeam,
+		beamCalled: beamCalled,
+	}
+	lister := &fakeLocalHardwareLister{
+		devices: []domain.Device{
+			{ID: "dev_a", Name: "Kitchen TV", Protocol: "dlna"},
+		},
+		called: listCalled,
+	}
+
+	writeRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      81,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name": "beam_media",
+			"arguments": map[string]any{
+				"source":        "/tmp/video.mp4",
+				"target_device": "dev_slow",
+				"transcode":     "never",
+			},
+		},
+	})
+	writeRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      82,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name": "list_local_hardware",
+			"arguments": map[string]any{
+				"timeout_ms": 1200,
+			},
+		},
+	})
+
+	srv := New(input, output, Config{
+		LocalHardwareLister: lister,
+		BeamController:      controller,
+	})
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- srv.Run(context.Background())
+	}()
+
+	select {
+	case <-beamCalled:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("beam_media was not called")
+	}
+
+	select {
+	case <-listCalled:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("list_local_hardware did not execute while beam_media was blocked")
+	}
+
+	close(releaseBeam)
+
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("run server: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not finish after releasing blocked beam call")
+	}
+
+	responses := readResponses(t, output.Bytes())
+	if len(responses) != 2 {
+		t.Fatalf("expected 2 responses, got %d", len(responses))
+	}
+
+	seen := map[int]bool{}
+	for _, resp := range responses {
+		id := int(resp["id"].(float64))
+		seen[id] = true
+	}
+	if !seen[81] || !seen[82] {
+		t.Fatalf("expected responses for ids 81 and 82, got %+v", seen)
 	}
 }
 
