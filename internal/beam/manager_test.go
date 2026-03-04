@@ -101,6 +101,7 @@ type fakeCastClient struct {
 	loadErr      error
 	loadErrs     []error
 	loadDelay    time.Duration
+	loadBlock    <-chan struct{}
 	seekErr      error
 	stopErr      error
 	closeErr     error
@@ -141,6 +142,9 @@ func (f *fakeCastClient) Connect() error {
 func (f *fakeCastClient) Load(mediaURL, contentType string, startTime int, duration float64, subtitleURL string, live bool) error {
 	if f.loadDelay > 0 {
 		time.Sleep(f.loadDelay)
+	}
+	if f.loadBlock != nil {
+		<-f.loadBlock
 	}
 	f.loadCalls++
 	f.loadURL = mediaURL
@@ -1184,6 +1188,60 @@ func TestBeamMediaChromecastLoadDeadlineGraceStillTimesOut(t *testing.T) {
 	if !strings.Contains(strings.ToLower(toolErr.Message), "context deadline exceeded") {
 		t.Fatalf("expected context deadline message, got %q", toolErr.Message)
 	}
+}
+
+func TestBeamMediaChromecastUnblocksOnPlayingFeedback(t *testing.T) {
+	tmpDir := t.TempDir()
+	mediaPath := filepath.Join(tmpDir, "sample.mp4")
+	if err := os.WriteFile(mediaPath, []byte("not-real-media"), 0o600); err != nil {
+		t.Fatalf("write media file: %v", err)
+	}
+
+	discovery := &fakeDiscovery{devices: []domain.Device{{
+		ID:       "dev_playing_ack",
+		Name:     "Playing Ack TV",
+		Address:  "http://127.0.0.1:8009",
+		Protocol: "chromecast",
+	}}}
+	releaseLoad := make(chan struct{})
+	castClient := &fakeCastClient{
+		loadBlock: releaseLoad,
+		statuses: []castprotocol.CastStatus{
+			{PlayerState: "BUFFERING"},
+			{PlayerState: "PLAYING"},
+			{PlayerState: "PLAYING"},
+		},
+	}
+	manager := NewManager(discovery, &fakeCastFactory{client: castClient}, nil)
+	defer manager.Close(context.Background())
+	manager.serverFactory = &fakeServerFactory{}
+	manager.listenAddressForDevice = func(deviceAddress string) (string, error) {
+		return "127.0.0.1:3566", nil
+	}
+	manager.retryAttempts = 1
+	manager.beamOperationTimeout = 2 * time.Second
+	manager.chromecastLoadDeadlineGrace = 0
+	manager.chromecastStatusPollEvery = 25 * time.Millisecond
+
+	started := time.Now()
+	result, err := manager.BeamMedia(context.Background(), domain.BeamRequest{
+		Source:       mediaPath,
+		TargetDevice: "dev_playing_ack",
+		Transcode:    "never",
+	})
+	elapsed := time.Since(started)
+	if err != nil {
+		t.Fatalf("beam media: %v", err)
+	}
+	if !result.OK {
+		t.Fatal("expected OK result")
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("expected beam_media to return quickly after playing feedback, elapsed=%s", elapsed)
+	}
+
+	// Release the blocked fake Load() call so the goroutine can exit in the test process.
+	close(releaseLoad)
 }
 
 func TestBeamMediaDLNAOperationTimeout(t *testing.T) {

@@ -50,7 +50,8 @@ const (
 
 	defaultBeamOperationTimeout        = 12 * time.Second
 	defaultDLNADirectURLAttemptTimeout = 4 * time.Second
-	defaultChromecastLoadDeadlineGrace = 20 * time.Second
+	defaultChromecastLoadDeadlineGrace = 4 * time.Second
+	defaultChromecastStatusPollEvery   = 250 * time.Millisecond
 
 	seekModeAbsoluteSeconds = "absolute_seconds"
 	seekModePercent         = "percent"
@@ -107,6 +108,7 @@ type Manager struct {
 	beamOperationTimeout        time.Duration
 	dlnaDirectURLAttemptTimeout time.Duration
 	chromecastLoadDeadlineGrace time.Duration
+	chromecastStatusPollEvery   time.Duration
 
 	cleanupLoopCancel context.CancelFunc
 	cleanupLoopDone   chan struct{}
@@ -202,6 +204,7 @@ func NewManager(discovery deviceLister, castFactory adapters.CastFactory, dlnaFa
 		beamOperationTimeout:        defaultBeamOperationTimeout,
 		dlnaDirectURLAttemptTimeout: defaultDLNADirectURLAttemptTimeout,
 		chromecastLoadDeadlineGrace: defaultChromecastLoadDeadlineGrace,
+		chromecastStatusPollEvery:   defaultChromecastStatusPollEvery,
 		cleanupLoopCancel:           cleanupCancel,
 		cleanupLoopDone:             make(chan struct{}),
 		sessionsByID:                map[string]*session{},
@@ -386,9 +389,14 @@ func (m *Manager) beamChromecast(ctx context.Context, req domain.BeamRequest, de
 		return nil, err
 	}
 
-	if err := m.withRetryDeadlineGrace(ctx, m.chromecastLoadDeadlineGrace, func() error {
-		return client.Load(playback.mediaURL, playback.mediaType, 0, playback.mediaDuration, playback.subtitleURL, playback.live)
-	}); err != nil {
+	loadResultCh := make(chan error, 1)
+	go func() {
+		// castprotocol.Load blocks until media completes; run it asynchronously and unblock as soon as
+		// device state reports playback started.
+		loadResultCh <- client.Load(playback.mediaURL, playback.mediaType, 0, playback.mediaDuration, playback.subtitleURL, playback.live)
+	}()
+
+	if err := m.waitForChromecastPlaybackStart(ctx, client, loadResultCh); err != nil {
 		cleanupPrepared(playback)
 		_ = client.Close(true)
 		return nil, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to start Chromecast playback: %v", err))
@@ -422,6 +430,52 @@ func (m *Manager) beamChromecast(ctx context.Context, req domain.BeamRequest, de
 		Transcoding: sess.Transcoding,
 		Warnings:    append([]string{}, sess.Warnings...),
 	}, nil
+}
+
+func (m *Manager) waitForChromecastPlaybackStart(ctx context.Context, client adapters.CastClient, loadResultCh <-chan error) error {
+	if loadResultCh == nil {
+		return errors.New("load result channel is nil")
+	}
+
+	pollEvery := m.chromecastStatusPollEvery
+	if pollEvery <= 0 {
+		pollEvery = defaultChromecastStatusPollEvery
+	}
+	ticker := time.NewTicker(pollEvery)
+	defer ticker.Stop()
+
+	var graceTimer *time.Timer
+	var graceC <-chan time.Time
+	ctxDone := ctx.Done()
+	defer func() {
+		if graceTimer != nil {
+			graceTimer.Stop()
+		}
+	}()
+
+	for {
+		select {
+		case err := <-loadResultCh:
+			return err
+		case <-ticker.C:
+			status, err := client.GetStatus()
+			if err != nil || status == nil {
+				continue
+			}
+			if normalizeCastState(status.PlayerState) == "playing" {
+				return nil
+			}
+		case <-ctxDone:
+			if !errors.Is(ctx.Err(), context.DeadlineExceeded) || m.chromecastLoadDeadlineGrace <= 0 {
+				return ctx.Err()
+			}
+			graceTimer = time.NewTimer(m.chromecastLoadDeadlineGrace)
+			graceC = graceTimer.C
+			ctxDone = nil
+		case <-graceC:
+			return context.DeadlineExceeded
+		}
+	}
 }
 
 func (m *Manager) beamDLNA(ctx context.Context, req domain.BeamRequest, device *domain.Device, mode string) (*domain.BeamResult, error) {
@@ -1104,19 +1158,10 @@ func (m *Manager) addSubtitleSidecar(server streamServer, listenAddr, subtitlesP
 }
 
 func (m *Manager) withRetry(ctx context.Context, call func() error) error {
-	return m.withRetryRunner(ctx, runCallWithContext, call)
+	return m.withRetryRunner(ctx, call)
 }
 
-func (m *Manager) withRetryDeadlineGrace(ctx context.Context, deadlineGrace time.Duration, call func() error) error {
-	return m.withRetryRunner(ctx, func(runCtx context.Context, runCall func() error) error {
-		return runCallWithContextAndDeadlineGrace(runCtx, deadlineGrace, runCall)
-	}, call)
-}
-
-func (m *Manager) withRetryRunner(ctx context.Context, runner func(context.Context, func() error) error, call func() error) error {
-	if runner == nil {
-		return errors.New("retry runner is nil")
-	}
+func (m *Manager) withRetryRunner(ctx context.Context, call func() error) error {
 	if call == nil {
 		return errors.New("retry call is nil")
 	}
@@ -1136,7 +1181,7 @@ func (m *Manager) withRetryRunner(ctx context.Context, runner func(context.Conte
 
 	var lastErr error
 	for attempt := 1; attempt <= attempts; attempt++ {
-		err := runner(ctx, call)
+		err := runCallWithContext(ctx, call)
 		if err == nil {
 			return nil
 		}
@@ -1170,34 +1215,6 @@ func runCallWithContext(ctx context.Context, call func() error) error {
 	case err := <-done:
 		return err
 	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-func runCallWithContextAndDeadlineGrace(ctx context.Context, deadlineGrace time.Duration, call func() error) error {
-	if ctx == nil {
-		return call()
-	}
-
-	done := make(chan error, 1)
-	go func() {
-		done <- call()
-	}()
-
-	select {
-	case err := <-done:
-		return err
-	case <-ctx.Done():
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) && deadlineGrace > 0 {
-			timer := time.NewTimer(deadlineGrace)
-			defer timer.Stop()
-
-			select {
-			case err := <-done:
-				return err
-			case <-timer.C:
-			}
-		}
 		return ctx.Err()
 	}
 }
