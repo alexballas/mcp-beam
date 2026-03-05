@@ -1,6 +1,6 @@
 # mcp-beam
 
-![mcp-beam app icon](./mcp-beam.png)
+![mcp-beam app icon](./assets/mcp-beam.png)
 
 ![CI](https://github.com/alexballas/mcp-beam/actions/workflows/ci.yml/badge.svg)
 ![Go 1.25+](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go)

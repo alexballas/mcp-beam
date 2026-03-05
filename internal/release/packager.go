@@ -163,7 +163,8 @@ func buildBinary(ctx context.Context, repoRoot string, target Target, outPath st
 func copyReleaseDocs(repoRoot, pkgDir string) error {
 	files := [][2]string{
 		{"README.md", "README.md"},
-		{"mcp-beam.png", "mcp-beam.png"},
+		{"assets/mcp-beam.png", "assets/mcp-beam.png"},
+		{"assets/demo.png", "assets/demo.png"},
 	}
 	for _, pair := range files {
 		src := filepath.Join(repoRoot, pair[0])
