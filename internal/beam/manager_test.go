@@ -1864,6 +1864,53 @@ func TestBeamMediaRejectsLoopbackURLByDefault(t *testing.T) {
 	}
 }
 
+func TestBeamMediaChromecastURLTranscodeValidatesSubtitlesPath(t *testing.T) {
+	discovery := &fakeDiscovery{devices: []domain.Device{{
+		ID:       "dev_url_subs_policy",
+		Name:     "URL Subs TV",
+		Address:  "http://127.0.0.1:8009",
+		Protocol: "chromecast",
+	}}}
+	manager := NewManager(discovery, &fakeCastFactory{client: &fakeCastClient{}}, nil)
+	defer manager.Close(context.Background())
+	manager.serverFactory = &fakeServerFactory{}
+	manager.listenAddressForDevice = func(deviceAddress string) (string, error) {
+		return "127.0.0.1:3572", nil
+	}
+	manager.lookPath = func(file string) (string, error) {
+		if file == "ffmpeg" {
+			return "/usr/bin/ffmpeg", nil
+		}
+		return "", errors.New("not found")
+	}
+	prepareCalled := false
+	manager.prepareURLMedia = func(ctx context.Context, sourceURL string) (any, string, error) {
+		prepareCalled = true
+		return io.NopCloser(strings.NewReader("video-bytes")), "video/mp4", nil
+	}
+
+	_, err := manager.BeamMedia(context.Background(), domain.BeamRequest{
+		Source:        "https://example.com/video.mp4",
+		TargetDevice:  "dev_url_subs_policy",
+		Transcode:     "always",
+		SubtitlesPath: "relative-subtitles.srt",
+	})
+	if err == nil {
+		t.Fatal("expected subtitles_path validation error")
+	}
+	if prepareCalled {
+		t.Fatal("expected subtitles_path validation before URL media preparation")
+	}
+
+	toolErr, ok := err.(*domain.ToolError)
+	if !ok {
+		t.Fatalf("expected ToolError, got %T", err)
+	}
+	if toolErr.Code != "FILE_NOT_READABLE" {
+		t.Fatalf("expected FILE_NOT_READABLE, got %s", toolErr.Code)
+	}
+}
+
 func TestBeamMediaStrictPathPolicyBlocked(t *testing.T) {
 	tmpDir := t.TempDir()
 	mediaPath := filepath.Join(tmpDir, "sample.mp4")
@@ -2472,7 +2519,9 @@ func containsWarning(warnings []string, needle string) bool {
 	return false
 }
 
-var _ adapters.CastClient = (*fakeCastClient)(nil)
-var _ adapters.CastFactory = (*fakeCastFactory)(nil)
-var _ adapters.DLNAFactory = (*fakeDLNAFactory)(nil)
-var _ adapters.DLNAPayload = (*fakeDLNAPayload)(nil)
+var (
+	_ adapters.CastClient  = (*fakeCastClient)(nil)
+	_ adapters.CastFactory = (*fakeCastFactory)(nil)
+	_ adapters.DLNAFactory = (*fakeDLNAFactory)(nil)
+	_ adapters.DLNAPayload = (*fakeDLNAPayload)(nil)
+)

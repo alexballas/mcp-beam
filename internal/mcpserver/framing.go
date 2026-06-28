@@ -13,10 +13,13 @@ import (
 func readMessage(r *bufio.Reader) ([]byte, bool, error) {
 	firstLine, err := r.ReadString('\n')
 	if err != nil {
-		if err == io.EOF && firstLine == "" {
-			return nil, false, io.EOF
+		if err == io.EOF {
+			if firstLine == "" {
+				return nil, false, io.EOF
+			}
+		} else {
+			return nil, false, err
 		}
-		return nil, false, err
 	}
 
 	if payload, ok, err := tryReadJSONLineMessage(r, firstLine); ok || err != nil {
@@ -98,6 +101,12 @@ func tryReadJSONLineMessage(r *bufio.Reader, firstLine string) ([]byte, bool, er
 	for {
 		line, err := r.ReadString('\n')
 		if err != nil {
+			if err == io.EOF {
+				if line != "" {
+					buf.WriteString(line)
+				}
+				return bytes.TrimSpace(buf.Bytes()), true, nil
+			}
 			return nil, true, err
 		}
 		buf.WriteString(line)

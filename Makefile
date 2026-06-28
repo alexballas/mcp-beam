@@ -16,6 +16,14 @@ fmt:
 	mkdir -p "$(GOCACHE)"
 	$(GOENV) $(GO) fmt ./...
 
+fmt-check:
+	@files="$$(find . -name '*.go' -not -path './dist/*' -exec gofmt -l {} +)"; \
+	if [ -n "$$files" ]; then \
+		echo "gofmt needed:"; \
+		echo "$$files"; \
+		exit 1; \
+	fi
+
 release:
 	mkdir -p "$(GOCACHE)"
 	$(GOENV) $(GO) run ./cmd/release-packager -out dist

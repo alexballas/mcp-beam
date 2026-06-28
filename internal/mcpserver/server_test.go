@@ -195,6 +195,30 @@ func TestInitializeJSONLineRequest(t *testing.T) {
 	}
 }
 
+func TestInvalidJSONLineReturnsParseError(t *testing.T) {
+	input := bytes.NewBufferString(`{"jsonrpc":"2.0","id":1,"method":`)
+	output := bytes.NewBuffer(nil)
+
+	srv := New(input, output, Config{})
+	if err := srv.Run(context.Background()); err != nil {
+		t.Fatalf("run server: %v", err)
+	}
+
+	line := strings.TrimSpace(output.String())
+	if line == "" {
+		t.Fatal("expected parse error response")
+	}
+
+	resp := map[string]any{}
+	if err := json.Unmarshal([]byte(line), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	errObj := resp["error"].(map[string]any)
+	if errObj["code"].(float64) != -32700 {
+		t.Fatalf("expected -32700, got %v", errObj["code"])
+	}
+}
+
 func TestUnknownMethod(t *testing.T) {
 	input := bytes.NewBuffer(nil)
 	output := bytes.NewBuffer(nil)

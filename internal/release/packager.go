@@ -148,7 +148,8 @@ func buildBinary(ctx context.Context, repoRoot string, target Target, outPath st
 	args := []string{"build", "-trimpath", "-ldflags", "-s -w", "-o", outPath, "."}
 	cmd := exec.CommandContext(ctx, "go", args...)
 	cmd.Dir = repoRoot
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(
+		os.Environ(),
 		"CGO_ENABLED=0",
 		"GOOS="+target.GOOS,
 		"GOARCH="+target.GOARCH,

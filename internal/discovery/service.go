@@ -176,11 +176,13 @@ func sortDevices(all []domain.Device) {
 		if protocolRank(all[i].Protocol) != protocolRank(all[j].Protocol) {
 			return protocolRank(all[i].Protocol) < protocolRank(all[j].Protocol)
 		}
-		if strings.ToLower(all[i].Name) != strings.ToLower(all[j].Name) {
-			return strings.ToLower(all[i].Name) < strings.ToLower(all[j].Name)
+		nameI, nameJ := strings.ToLower(all[i].Name), strings.ToLower(all[j].Name)
+		if nameI != nameJ {
+			return nameI < nameJ
 		}
-		if strings.ToLower(all[i].Address) != strings.ToLower(all[j].Address) {
-			return strings.ToLower(all[i].Address) < strings.ToLower(all[j].Address)
+		addressI, addressJ := strings.ToLower(all[i].Address), strings.ToLower(all[j].Address)
+		if addressI != addressJ {
+			return addressI < addressJ
 		}
 		return all[i].ID < all[j].ID
 	})

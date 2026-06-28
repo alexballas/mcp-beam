@@ -821,9 +821,14 @@ func (m *Manager) prepareURLPlayback(ctx context.Context, req domain.BeamRequest
 		}, nil
 	}
 
+	subtitlesPath, err := m.validateLocalFilePath(req.SubtitlesPath, "subtitles_path")
+	if err != nil {
+		return nil, err
+	}
+
 	var preparedMedia any
 	var mediaType string
-	err := m.withRetry(ctx, func() error {
+	err = m.withRetry(ctx, func() error {
 		var callErr error
 		preparedMedia, mediaType, callErr = m.prepareURLMedia(ctx, sourceURL)
 		return callErr
@@ -869,7 +874,7 @@ func (m *Manager) prepareURLPlayback(ctx context.Context, req domain.BeamRequest
 	if transcoding {
 		tcOpts = &utils.TranscodeOptions{
 			FFmpegPath:   ffmpegPath,
-			SubsPath:     validatedSubtitlePath(req.SubtitlesPath),
+			SubsPath:     validatedSubtitlePath(subtitlesPath),
 			SeekSeconds:  startAt,
 			SubtitleSize: utils.SubtitleSizeMedium,
 		}
@@ -878,7 +883,7 @@ func (m *Manager) prepareURLPlayback(ctx context.Context, req domain.BeamRequest
 
 	server.AddHandler(route, nil, tcOpts, preparedMedia)
 
-	subtitleURL, subtitleWarnings, subtitleErr := m.addSubtitleSidecar(server, listenAddr, req.SubtitlesPath, transcoding)
+	subtitleURL, subtitleWarnings, subtitleErr := m.addSubtitleSidecar(server, listenAddr, subtitlesPath, transcoding)
 	if subtitleErr != nil {
 		cleanupPrepared(&preparedPlayback{httpServer: server, sourceCloser: asCloser(preparedMedia)})
 		return nil, subtitleErr
@@ -1101,8 +1106,13 @@ func (m *Manager) newDLNAPayload(
 }
 
 func (m *Manager) runDLNAStateMonitor(ctx context.Context, sess *session) {
-	defer close(sess.monitorDone)
-	if sess == nil || sess.dlnaPayload == nil {
+	if sess == nil {
+		return
+	}
+	if sess.monitorDone != nil {
+		defer close(sess.monitorDone)
+	}
+	if sess.dlnaPayload == nil {
 		return
 	}
 
@@ -1400,7 +1410,7 @@ func isTransientNetworkError(err error) bool {
 	}
 
 	var netErr net.Error
-	if errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary()) {
+	if errors.As(err, &netErr) && netErr.Timeout() {
 		return true
 	}
 
