@@ -3,7 +3,7 @@
 ![mcp-beam app icon](./assets/mcp-beam.png)
 
 ![CI](https://github.com/alexballas/mcp-beam/actions/workflows/ci.yml/badge.svg)
-![Go 1.25+](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go)
+![Go 1.26+](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go)
 
 ## Demo
 
@@ -80,7 +80,7 @@ Generic JSON configuration (for MCP hosts using `mcpServers`):
 ```
 
 Notes:
-- Requires `go` in `PATH` (Go `1.25+`).
+- Requires `go` in `PATH` (Go `1.26+`).
 - The first run may be slower due to module download/build.
 
 ### 2) Verify the server binary/module wiring
@@ -231,7 +231,7 @@ go build -o ./bin/mcp-beam .
 ```
 
 Or install from releases:
-- `https://github.com/alex/mcp-beam/releases`
+- `https://github.com/alexballas/mcp-beam/releases`
 
 Linux/macOS checksum verify:
 
@@ -276,7 +276,8 @@ MCP config for a local binary:
 
 ## Runtime Dependencies
 
-- `go` (Go 1.25+) is required to run the server. See [Go Installation](#go-installation) below.
+- `go` (Go 1.26+) is required when using `go run`, building locally, or packaging releases. See [Go Installation](#go-installation) below.
+- Downloaded release binaries do not require a local Go installation.
 - `ffmpeg` and `ffprobe` are optional for non-transcoding paths, but recommended.
   - If transcoding is required and `ffmpeg` is unavailable, calls return `FFMPEG_NOT_FOUND`.
 
@@ -295,7 +296,7 @@ Download and install from https://go.dev/dl/ or via package manager:
 Download and install from https://go.dev/dl/ or use Homebrew:
 
 ```bash
-brew install go@1.25
+brew install go
 ```
 
 #### Windows
@@ -308,7 +309,7 @@ Download and install from https://go.dev/dl/
 go version
 ```
 
-Should output: `go1.25.0` or higher.
+Should output: `go1.26.0` or higher.
 
 Install examples:
 - Linux: package manager (for example `sudo apt install ffmpeg`)
@@ -602,6 +603,9 @@ Common tool error codes:
 - `UNSUPPORTED_URL_PATTERN`
 - `TRANSCODE_REQUIRED`
 - `FFMPEG_NOT_FOUND`
+- `SEEK_MODE_INVALID`
+- `SEEK_POSITION_INVALID`
+- `SEEK_DURATION_UNKNOWN`
 - `PROTOCOL_ERROR`
 - `INTERNAL_ERROR`
 
@@ -614,6 +618,7 @@ Common tool error codes:
 | `MCP_BEAM_ALLOW_LOOPBACK_URLS` | `false` | Allows `localhost`/loopback URL hosts when `true`. |
 | `MCP_BEAM_ALLOW_WILDCARD_BIND` | `false` | Allows wildcard bind addresses when `true`. |
 | `MCP_BEAM_LOG_LEVEL` | `info` | Server log level: `debug`, `info`, `warn`, `error`. |
+| `MCP_BEAM_HANDLE_SIGINT` | `false` | Handles `SIGINT` internally when `true`; by default, MCP hosts control interrupt handling. |
 
 ## Security
 
