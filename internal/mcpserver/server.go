@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -484,12 +485,10 @@ func (s *Server) handleSeekBeamingCall(ctx context.Context, id json.RawMessage, 
 	}
 
 	var args struct {
-		TargetDevice    *string  `json:"target_device,omitempty"`
-		SessionID       *string  `json:"session_id,omitempty"`
-		PositionSeconds *int     `json:"position_seconds,omitempty"`
-		PositionPercent *float64 `json:"position_percent,omitempty"`
-		FromEndSeconds  *int     `json:"from_end_seconds,omitempty"`
-		DeltaSeconds    *int     `json:"delta_seconds,omitempty"`
+		TargetDevice *string  `json:"target_device,omitempty"`
+		SessionID    *string  `json:"session_id,omitempty"`
+		Mode         *string  `json:"mode,omitempty"`
+		Value        *float64 `json:"value,omitempty"`
 	}
 	if err := decodeStrict(rawArgs, &args); err != nil {
 		return s.sendInvalidParams("seek_beaming", "", "", startedAt, id)
@@ -508,40 +507,41 @@ func (s *Server) handleSeekBeamingCall(ctx context.Context, id json.RawMessage, 
 		return s.sendInvalidParams("seek_beaming", targetDevice, sessionID, startedAt, id)
 	}
 
-	modeCount := 0
-	if args.PositionSeconds != nil {
-		if *args.PositionSeconds < 0 {
-			return s.sendInvalidParams("seek_beaming", targetDevice, sessionID, startedAt, id)
-		}
-		modeCount++
-	}
-	if args.PositionPercent != nil {
-		if *args.PositionPercent < 0 || *args.PositionPercent > 100 {
-			return s.sendInvalidParams("seek_beaming", targetDevice, sessionID, startedAt, id)
-		}
-		modeCount++
-	}
-	if args.FromEndSeconds != nil {
-		if *args.FromEndSeconds < 0 {
-			return s.sendInvalidParams("seek_beaming", targetDevice, sessionID, startedAt, id)
-		}
-		modeCount++
-	}
-	if args.DeltaSeconds != nil {
-		modeCount++
-	}
-	if modeCount != 1 {
+	if args.Mode == nil || args.Value == nil {
 		return s.sendInvalidParams("seek_beaming", targetDevice, sessionID, startedAt, id)
 	}
 
-	result, err := s.beamController.SeekBeaming(ctx, domain.SeekRequest{
-		TargetDevice:    targetDevice,
-		SessionID:       sessionID,
-		PositionSeconds: args.PositionSeconds,
-		PositionPercent: args.PositionPercent,
-		FromEndSeconds:  args.FromEndSeconds,
-		DeltaSeconds:    args.DeltaSeconds,
-	})
+	seekReq := domain.SeekRequest{
+		TargetDevice: targetDevice,
+		SessionID:    sessionID,
+	}
+	value := *args.Value
+	switch *args.Mode {
+	case "absolute_seconds":
+		if value < 0 {
+			return s.sendInvalidParams("seek_beaming", targetDevice, sessionID, startedAt, id)
+		}
+		seconds := int(math.Round(value))
+		seekReq.PositionSeconds = &seconds
+	case "percent":
+		if value < 0 || value > 100 {
+			return s.sendInvalidParams("seek_beaming", targetDevice, sessionID, startedAt, id)
+		}
+		seekReq.PositionPercent = &value
+	case "from_end_seconds":
+		if value < 0 {
+			return s.sendInvalidParams("seek_beaming", targetDevice, sessionID, startedAt, id)
+		}
+		seconds := int(math.Round(value))
+		seekReq.FromEndSeconds = &seconds
+	case "delta_seconds":
+		seconds := int(math.Round(value))
+		seekReq.DeltaSeconds = &seconds
+	default:
+		return s.sendInvalidParams("seek_beaming", targetDevice, sessionID, startedAt, id)
+	}
+
+	result, err := s.beamController.SeekBeaming(ctx, seekReq)
 	if err != nil {
 		s.logCall("seek_beaming", targetDevice, sessionID, startedAt, toolErrorCode(err))
 		return s.send(response{
@@ -977,7 +977,7 @@ func staticTools() []tool {
 		},
 		{
 			Name:        "seek_beaming",
-			Description: "Seek active playback on a selected device or session. Provide session_id or target_device, and exactly one seek mode field. For skip or rewind, use delta_seconds. For an exact timestamp from the beginning, use position_seconds.",
+			Description: "Seek active playback on a selected device or session. Identify the target with session_id or target_device, then set 'mode' to choose how to seek and 'value' to the amount. Provide exactly one mode and one value.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -989,28 +989,27 @@ func staticTools() []tool {
 						"type":        "string",
 						"description": "The unique session ID to seek. This is returned by a successful 'beam_media' call.",
 					},
-					"position_seconds": map[string]any{
-						"type":        "integer",
-						"minimum":     0,
-						"description": "Absolute seek target in whole seconds from the start of media. Example: use 120 to seek to 2:00.",
+					"mode": map[string]any{
+						"type": "string",
+						"enum": []string{"absolute_seconds", "percent", "from_end_seconds", "delta_seconds"},
+						"description": "How to interpret 'value': " +
+							"'absolute_seconds' jumps to a timestamp measured from the start; " +
+							"'percent' jumps to a percentage of the total duration; " +
+							"'from_end_seconds' jumps to a point measured back from the end; " +
+							"'delta_seconds' skips relative to the current position. " +
+							"For an exact timestamp use 'absolute_seconds'; for skip/rewind use 'delta_seconds'.",
 					},
-					"position_percent": map[string]any{
-						"type":        "number",
-						"minimum":     0,
-						"maximum":     100,
-						"description": "Seek target as a percentage of total duration (0-100). Example: use 50 for the middle of the media.",
-					},
-					"from_end_seconds": map[string]any{
-						"type":        "integer",
-						"minimum":     0,
-						"description": "Seek target measured backward from the media end in whole seconds. Example: use 10 to seek to ten seconds before the end.",
-					},
-					"delta_seconds": map[string]any{
-						"type":        "integer",
-						"description": "Relative seek delta from the current playback position in whole seconds. Example: use 30 to skip ahead or -10 to rewind.",
+					"value": map[string]any{
+						"type": "number",
+						"description": "The seek amount, interpreted by 'mode'. " +
+							"absolute_seconds: whole seconds from the start, 0 or greater (e.g. 4140 for 1:09:00). " +
+							"percent: 0 to 100 (e.g. 50 for the middle). " +
+							"from_end_seconds: whole seconds before the end, 0 or greater (e.g. 10 for ten seconds before the end). " +
+							"delta_seconds: relative seconds, positive to skip ahead or negative to rewind (e.g. 30 or -10).",
 					},
 				},
-				"minProperties":        2,
+				"required":             []string{"mode", "value"},
+				"minProperties":        3,
 				"additionalProperties": false,
 			},
 		},

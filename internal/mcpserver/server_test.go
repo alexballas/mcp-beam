@@ -189,6 +189,73 @@ func TestToolsListInputSchemasDoNotUseTopLevelCombinators(t *testing.T) {
 	}
 }
 
+// TestSeekBeamingSchemaUsesSingleModeAndValue guards the model-facing contract:
+// seek_beaming must expose a single discriminated mode+value pair rather than the
+// old parallel position_seconds/position_percent/from_end_seconds/delta_seconds
+// fields. The parallel fields invited models (e.g. GPT-5.5) to send all of them
+// padded with zeros, which the handler rejected as multiple modes.
+func TestSeekBeamingSchemaUsesSingleModeAndValue(t *testing.T) {
+	input := bytes.NewBuffer(nil)
+	output := bytes.NewBuffer(nil)
+
+	writeRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      11,
+		"method":  "tools/list",
+	})
+
+	srv := New(input, output, Config{})
+	if err := srv.Run(context.Background()); err != nil {
+		t.Fatalf("run server: %v", err)
+	}
+
+	responses := readResponses(t, output.Bytes())
+	tools := responses[0]["result"].(map[string]any)["tools"].([]any)
+
+	var schema map[string]any
+	for _, toolAny := range tools {
+		tool := toolAny.(map[string]any)
+		if tool["name"].(string) == "seek_beaming" {
+			schema = tool["inputSchema"].(map[string]any)
+			break
+		}
+	}
+	if schema == nil {
+		t.Fatal("seek_beaming tool not found")
+	}
+
+	props := schema["properties"].(map[string]any)
+	for _, removed := range []string{"position_seconds", "position_percent", "from_end_seconds", "delta_seconds"} {
+		if _, exists := props[removed]; exists {
+			t.Fatalf("seek_beaming must not expose the parallel field %q", removed)
+		}
+	}
+
+	modeProp, ok := props["mode"].(map[string]any)
+	if !ok {
+		t.Fatal("seek_beaming must expose a mode property")
+	}
+	enum, ok := modeProp["enum"].([]any)
+	if !ok || len(enum) != 4 {
+		t.Fatalf("mode enum must list the four seek modes, got %#v", modeProp["enum"])
+	}
+	if _, ok := props["value"].(map[string]any); !ok {
+		t.Fatal("seek_beaming must expose a value property")
+	}
+
+	required, ok := schema["required"].([]any)
+	if !ok {
+		t.Fatalf("seek_beaming must require mode and value, got %#v", schema["required"])
+	}
+	got := map[string]bool{}
+	for _, r := range required {
+		got[r.(string)] = true
+	}
+	if !got["mode"] || !got["value"] {
+		t.Fatalf("seek_beaming required must include mode and value, got %#v", required)
+	}
+}
+
 func TestInitializeJSONLineRequest(t *testing.T) {
 	input := bytes.NewBuffer(nil)
 	output := bytes.NewBuffer(nil)
@@ -1189,8 +1256,9 @@ func TestToolsCallSeekBeaming(t *testing.T) {
 		"params": map[string]any{
 			"name": "seek_beaming",
 			"arguments": map[string]any{
-				"session_id":       "sess_seek_1",
-				"position_seconds": 95,
+				"session_id": "sess_seek_1",
+				"mode":       "absolute_seconds",
+				"value":      95,
 			},
 		},
 	})
@@ -1240,7 +1308,9 @@ func TestToolsCallSeekBeamingInvalidParams(t *testing.T) {
 		"params": map[string]any{
 			"name": "seek_beaming",
 			"arguments": map[string]any{
-				"position_seconds": -1,
+				"session_id": "sess_seek_1",
+				"mode":       "absolute_seconds",
+				"value":      -1,
 			},
 		},
 	})
@@ -1282,8 +1352,9 @@ func TestToolsCallSeekBeamingPercent(t *testing.T) {
 		"params": map[string]any{
 			"name": "seek_beaming",
 			"arguments": map[string]any{
-				"target_device":    "dev_1",
-				"position_percent": 25.0,
+				"target_device": "dev_1",
+				"mode":          "percent",
+				"value":         25.0,
 			},
 		},
 	})
@@ -1326,8 +1397,9 @@ func TestToolsCallSeekBeamingFromEnd(t *testing.T) {
 		"params": map[string]any{
 			"name": "seek_beaming",
 			"arguments": map[string]any{
-				"session_id":       "sess_seek_end",
-				"from_end_seconds": 10,
+				"session_id": "sess_seek_end",
+				"mode":       "from_end_seconds",
+				"value":      10,
 			},
 		},
 	})
@@ -1370,8 +1442,9 @@ func TestToolsCallSeekBeamingDelta(t *testing.T) {
 		"params": map[string]any{
 			"name": "seek_beaming",
 			"arguments": map[string]any{
-				"session_id":    "sess_seek_delta",
-				"delta_seconds": -10,
+				"session_id": "sess_seek_delta",
+				"mode":       "delta_seconds",
+				"value":      -10,
 			},
 		},
 	})
@@ -1424,7 +1497,7 @@ func TestToolsCallSeekBeamingInvalidParamsMissingMode(t *testing.T) {
 	}
 }
 
-func TestToolsCallSeekBeamingInvalidParamsMultipleModes(t *testing.T) {
+func TestToolsCallSeekBeamingInvalidParamsUnknownMode(t *testing.T) {
 	input := bytes.NewBuffer(nil)
 	output := bytes.NewBuffer(nil)
 
@@ -1435,9 +1508,9 @@ func TestToolsCallSeekBeamingInvalidParamsMultipleModes(t *testing.T) {
 		"params": map[string]any{
 			"name": "seek_beaming",
 			"arguments": map[string]any{
-				"session_id":       "sess_seek_1",
-				"position_seconds": 15,
-				"position_percent": 10,
+				"session_id": "sess_seek_1",
+				"mode":       "bananas",
+				"value":      15,
 			},
 		},
 	})
@@ -1468,8 +1541,9 @@ func TestToolsCallSeekBeamingInvalidParamsPercentOutOfRange(t *testing.T) {
 		"params": map[string]any{
 			"name": "seek_beaming",
 			"arguments": map[string]any{
-				"session_id":       "sess_seek_1",
-				"position_percent": 140,
+				"session_id": "sess_seek_1",
+				"mode":       "percent",
+				"value":      140,
 			},
 		},
 	})

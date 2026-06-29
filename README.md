@@ -152,7 +152,8 @@ Minimal example flow:
   "name": "seek_beaming",
   "arguments": {
     "session_id": "sess_abcd1234",
-    "position_percent": 50
+    "mode": "percent",
+    "value": 50
   }
 }
 ```
@@ -515,11 +516,12 @@ Seek an active beam session by absolute position, percentage, from-end offset, o
 Arguments:
 - `target_device` (optional string)
 - `session_id` (optional string)
-- Exactly one of:
-- `position_seconds` (integer, minimum `0`)
-- `position_percent` (number, range `0` to `100`)
-- `from_end_seconds` (integer, minimum `0`)
-- `delta_seconds` (integer): relative delta from the current playback position; negative values rewind
+- `mode` (required string): how to interpret `value`. One of:
+- `absolute_seconds`: jump to a timestamp measured from the start
+- `percent`: jump to a percentage of the total duration (`0` to `100`)
+- `from_end_seconds`: jump to a point measured back from the end
+- `delta_seconds`: skip relative to the current position; negative values rewind
+- `value` (required number): the seek amount, interpreted by `mode`.
 - At least one of `target_device` or `session_id` is required.
 
 Example:
@@ -529,7 +531,8 @@ Example:
   "name": "seek_beaming",
   "arguments": {
     "session_id": "sess_abcd1234",
-    "from_end_seconds": 10
+    "mode": "from_end_seconds",
+    "value": 10
   }
 }
 ```
@@ -544,14 +547,14 @@ On success, `structuredContent` includes:
 - optional `duration_seconds`
 
 Examples:
-- Middle of media: `position_percent: 50`
-- Ten seconds from end: `from_end_seconds: 10`
-- Exact second: `position_seconds: 120`
-- Skip ahead 30 seconds: `delta_seconds: 30`
-- Rewind 10 seconds: `delta_seconds: -10`
+- Middle of media: `mode: percent`, `value: 50`
+- Ten seconds from end: `mode: from_end_seconds`, `value: 10`
+- Exact second: `mode: absolute_seconds`, `value: 120`
+- Skip ahead 30 seconds: `mode: delta_seconds`, `value: 30`
+- Rewind 10 seconds: `mode: delta_seconds`, `value: -10`
 
 Note:
-- Relative modes (`position_percent`, `from_end_seconds`) require known media duration.
+- Duration-relative modes (`percent`, `from_end_seconds`) require known media duration.
 
 ## Transcode Behavior
 
