@@ -267,6 +267,21 @@ func (s *Server) handleToolCall(ctx context.Context, id json.RawMessage, rawPara
 	}
 }
 
+// isProtocolCallParam reports whether a top-level `tools/call` param belongs to
+// the protocol rather than to the tool's arguments. Clients that omit
+// `arguments` fall through to the flattening path below, which must not fold
+// these into the argument object: strict decoding would then reject the call as
+// carrying unknown fields. `inputResponses` and `requestState` arrive on multi
+// round-trip retries, which this server never asks for but may still receive.
+func isProtocolCallParam(key string) bool {
+	switch key {
+	case "name", "_meta", "inputResponses", "requestState":
+		return true
+	default:
+		return false
+	}
+}
+
 func decodeToolCallParams(raw json.RawMessage) (toolsCallParams, error) {
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &payload); err != nil {
@@ -291,7 +306,7 @@ func decodeToolCallParams(raw json.RawMessage) (toolsCallParams, error) {
 	if !ok {
 		flattened := map[string]json.RawMessage{}
 		for key, value := range payload {
-			if key == "name" || key == "_meta" {
+			if isProtocolCallParam(key) {
 				continue
 			}
 			flattened[key] = value
@@ -1011,8 +1026,12 @@ func staticTools() []tool {
 			},
 		},
 		{
-			Name:        "beam_media",
-			Description: "Cast or stream media (video, audio, etc.) to a selected local Smart TV, Chromecast, or UPnP/DLNA device. You must provide a valid target_device ID or name.",
+			Name: "beam_media",
+			Description: "Cast or stream media (video, audio, etc.) to a selected local Smart TV, Chromecast, or UPnP/DLNA device. " +
+				"You must provide a valid target_device ID or name. " +
+				"Returns a session_id accepted by the other beaming tools. Sessions live only in this server process: they are lost if it restarts, " +
+				"and are reclaimed automatically after about 10 minutes idle or stalled, 90 minutes paused, or 24 hours in total. " +
+				"If a session_id is no longer recognized, start a new beam rather than retrying with it.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{

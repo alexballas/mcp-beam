@@ -1663,6 +1663,66 @@ func TestDecodeStrictRejectsTrailingJSON(t *testing.T) {
 	}
 }
 
+// A client omitting `arguments` falls through to the flattening path, which
+// must treat multi round-trip params as protocol-level rather than folding them
+// into the tool's arguments and failing strict decoding.
+func TestToolsCallIgnoresMultiRoundTripParamsWhenFlattening(t *testing.T) {
+	input := bytes.NewBuffer(nil)
+	output := bytes.NewBuffer(nil)
+
+	lister := &fakeLocalHardwareLister{devices: []domain.Device{{ID: "dev-1", Name: "TV"}}}
+	writeJSONLineRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name":           "list_local_hardware",
+			"inputResponses": map[string]any{"login": map[string]any{"action": "accept"}},
+			"requestState":   "eyJsb2NhdGlvbiI6Ik5ldyBZb3JrIn0",
+			"_meta":          modernMeta(),
+		},
+	})
+
+	srv := New(input, output, Config{LocalHardwareLister: lister})
+	if err := srv.Run(context.Background()); err != nil {
+		t.Fatalf("run server: %v", err)
+	}
+
+	responses := readResponses(t, output.Bytes())
+	if len(responses) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(responses))
+	}
+	if respErr, isError := responses[0]["error"]; isError {
+		t.Fatalf("multi round-trip params must not be folded into arguments: %#v", respErr)
+	}
+	if responses[0]["result"].(map[string]any)["isError"] == true {
+		t.Fatalf("expected a successful call: %#v", responses[0]["result"])
+	}
+}
+
+func TestDecodeToolCallParamsSeparatesProtocolParamsFromArguments(t *testing.T) {
+	params, err := decodeToolCallParams(json.RawMessage(
+		`{"name":"seek_beaming","requestState":"abc","mode":"percent","value":50}`,
+	))
+	if err != nil {
+		t.Fatalf("decode params: %v", err)
+	}
+	if params.Name != "seek_beaming" {
+		t.Fatalf("name mismatch: %q", params.Name)
+	}
+
+	var arguments map[string]any
+	if err := json.Unmarshal(params.Arguments, &arguments); err != nil {
+		t.Fatalf("unmarshal arguments: %v", err)
+	}
+	if _, exists := arguments["requestState"]; exists {
+		t.Fatalf("requestState must not appear in arguments: %#v", arguments)
+	}
+	if arguments["mode"] != "percent" || arguments["value"].(float64) != 50 {
+		t.Fatalf("tool arguments must survive flattening: %#v", arguments)
+	}
+}
+
 // modernMeta builds the per-request `_meta` a 2026-07-28 client sends.
 func modernMeta() map[string]any {
 	return map[string]any{
