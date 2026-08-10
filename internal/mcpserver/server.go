@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,7 +18,8 @@ import (
 	"go2tv.app/mcp-beam/internal/domain"
 )
 
-const protocolVersion = "2024-11-05"
+const serverInstructions = "Use tools/list to inspect available tools."
+
 const (
 	defaultDiscoveryTimeoutMS = 5000
 	minDiscoveryTimeoutMS     = 100
@@ -152,25 +154,59 @@ func (s *Server) handle(ctx context.Context, payload []byte) error {
 		})
 	}
 
+	meta, err := decodeRequestMeta(req.Params)
+	if err != nil {
+		s.logCall(req.Method, "", "", startedAt, "-32602")
+		return s.send(response{
+			JSONRPC: "2.0",
+			ID:      req.ID,
+			Error: &responseError{
+				Code:    -32602,
+				Message: "invalid params",
+			},
+		})
+	}
+
+	// Era selection. An `initialize` request always selects legacy semantics,
+	// even if it carries modern `_meta`. `server/discover` exists only in the
+	// modern revision, so it is always validated. Everything else is validated
+	// only once the client has identified itself as modern -- a legacy client
+	// omits `_meta` entirely and must keep working unchanged.
+	if req.Method != "initialize" && (meta.isModern() || req.Method == "server/discover") {
+		if errResp := validateRequestMeta(meta); errResp != nil {
+			s.logCall(req.Method, "", "", startedAt, strconv.Itoa(errResp.Code))
+			return s.send(response{JSONRPC: "2.0", ID: req.ID, Error: errResp})
+		}
+	}
+
 	switch req.Method {
 	case "initialize":
 		s.logCall("initialize", "", "", startedAt, "")
 		return s.send(response{JSONRPC: "2.0", ID: req.ID, Result: initializeResult{
-			ProtocolVersion: protocolVersion,
-			Capabilities: map[string]any{
-				"tools": map[string]any{
-					"listChanged": false,
-				},
-			},
+			ProtocolVersion: protocolVersionLegacy,
+			Capabilities:    serverCapabilities(),
 			ServerInfo: map[string]string{
 				"name":    s.serverName,
 				"version": s.serverVersion,
 			},
-			Instructions: "Use tools/list to inspect available tools.",
+			Instructions: serverInstructions,
+		}})
+	case "server/discover":
+		s.logCall("server/discover", "", "", startedAt, "")
+		return s.send(response{JSONRPC: "2.0", ID: req.ID, Result: discoverResult{
+			SupportedVersions: supportedProtocolVersions,
+			Capabilities:      serverCapabilities(),
+			Instructions:      serverInstructions,
+			TTLMs:             staticListTTLMs,
+			CacheScope:        cacheScopePublic,
 		}})
 	case "tools/list":
 		s.logCall("tools/list", "", "", startedAt, "")
-		return s.send(response{JSONRPC: "2.0", ID: req.ID, Result: toolsListResult{Tools: s.tools}})
+		return s.send(response{JSONRPC: "2.0", ID: req.ID, Result: toolsListResult{
+			Tools:      s.tools,
+			TTLMs:      staticListTTLMs,
+			CacheScope: cacheScopePublic,
+		}})
 	case "tools/call":
 		toolID := append(json.RawMessage(nil), req.ID...)
 		toolParams := append(json.RawMessage(nil), req.Params...)
@@ -691,6 +727,73 @@ func (s *Server) handleListLocalHardwareCall(ctx context.Context, id json.RawMes
 	})
 }
 
+// validateRequestMeta enforces the per-request protocol fields the modern
+// revision requires. The version is checked before the remaining fields so that
+// a client speaking a revision this server does not know is told to downgrade
+// rather than being told its request is malformed by this revision's rules.
+func validateRequestMeta(meta *requestMeta) *responseError {
+	if !meta.isModern() {
+		return &responseError{Code: -32602, Message: "invalid params"}
+	}
+
+	if !isSupportedProtocolVersion(*meta.ProtocolVersion) {
+		return &responseError{
+			Code:    errUnsupportedProtocolVersion,
+			Message: "Unsupported protocol version",
+			Data: unsupportedVersionData{
+				Supported: supportedProtocolVersions,
+				Requested: *meta.ProtocolVersion,
+			},
+		}
+	}
+
+	if !meta.hasClientCapabilities() {
+		return &responseError{Code: -32602, Message: "invalid params"}
+	}
+
+	return nil
+}
+
+func serverCapabilities() map[string]any {
+	return map[string]any{
+		"tools": map[string]any{
+			"listChanged": false,
+		},
+	}
+}
+
+func (s *Server) resultMeta() map[string]any {
+	return map[string]any{
+		metaServerInfo: map[string]string{
+			"name":    s.serverName,
+			"version": s.serverVersion,
+		},
+	}
+}
+
+// finalizeResult stamps the fields every modern result carries: the mandatory
+// `resultType` and the recommended server identity. Applying it centrally in
+// the send path is what guarantees no handler can omit them. Legacy-only
+// results (initializeResult) are not listed and pass through untouched.
+func (s *Server) finalizeResult(result any) any {
+	switch typed := result.(type) {
+	case discoverResult:
+		typed.ResultType = resultTypeComplete
+		typed.Meta = s.resultMeta()
+		return typed
+	case toolsListResult:
+		typed.ResultType = resultTypeComplete
+		typed.Meta = s.resultMeta()
+		return typed
+	case toolCallResult:
+		typed.ResultType = resultTypeComplete
+		typed.Meta = s.resultMeta()
+		return typed
+	default:
+		return result
+	}
+}
+
 func decodeStrict(raw json.RawMessage, out any) error {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
@@ -805,6 +908,7 @@ func (s *Server) send(resp response) error {
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
 
+	resp.Result = s.finalizeResult(resp.Result)
 	encoded, err := json.Marshal(resp)
 	if err != nil {
 		return err
