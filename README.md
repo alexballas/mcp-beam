@@ -9,7 +9,7 @@
 
 ![mcp-beam demo](./assets/demo.png)
 
-`mcp-beam` is a MCP server (`stdio` transport) for casting local files and media URLs to Chromecast and DLNA/UPnP devices on your LAN.
+`mcp-beam` is a MCP server (`stdio` transport) for casting local files and media URLs to Chromecast and DLNA/UPnP devices on your LAN. It speaks both the `2026-07-28` and `2024-11-05` protocol revisions.
 
 It exposes seven tools:
 - `list_local_hardware`
@@ -35,6 +35,7 @@ It exposes seven tools:
 - [Installation](#installation)
 - [Runtime Dependencies](#runtime-dependencies)
   - [Go Installation](#go-installation)
+- [Protocol Support](#protocol-support)
 - [Tool Reference](#tool-reference)
 - [Transcode Behavior](#transcode-behavior)
 - [Error Model](#error-model)
@@ -320,6 +321,31 @@ Verify:
 - Linux/macOS: `command -v ffmpeg && command -v ffprobe`
 - Windows: `where ffmpeg` and `where ffprobe`
 
+## Protocol Support
+
+`mcp-beam` serves two MCP revisions concurrently and picks between them per request, so hosts on either era work against the same binary.
+
+| Revision | Selected by | Notes |
+| --- | --- | --- |
+| `2026-07-28` | A request carrying `io.modelcontextprotocol/protocolVersion` in `params._meta` | Stateless; version, identity, and capabilities travel per request. |
+| `2024-11-05` | An `initialize` handshake, or any request without that `_meta` | Legacy handshake, served unchanged. |
+
+Methods:
+
+| Method | Revision |
+| --- | --- |
+| `server/discover` | `2026-07-28` |
+| `initialize` | `2024-11-05` |
+| `tools/list`, `tools/call` | both |
+
+Notes for `2026-07-28` clients:
+- Every request must carry `io.modelcontextprotocol/protocolVersion` and `io.modelcontextprotocol/clientCapabilities` in `params._meta`. A missing field is `-32602`.
+- An unsupported version returns `-32022` with `data.supported` listing the versions to retry with.
+- `server/discover` and `tools/list` are cacheable and carry `ttlMs` and `cacheScope`.
+- Results are always `resultType: "complete"`. `mcp-beam` never returns `input_required`: it needs no sampling, elicitation, or roots.
+
+The `session_id` returned by `beam_media` is the explicit handle the stateless model calls for. Sessions are process-local and do not survive a restart; see [Session lifecycle defaults](#architecture) for how long they are retained.
+
 ## Tool Reference
 
 ### `list_local_hardware`
@@ -582,7 +608,8 @@ Edge cases:
 ## Error Model
 
 Input validation failures:
-- JSON-RPC error `-32602` (`invalid params`)
+- JSON-RPC error `-32602` (`invalid params`), including a `2026-07-28` request missing a required `_meta` field
+- JSON-RPC error `-32022` (`Unsupported protocol version`), with `data.supported` and `data.requested`
 
 Tool failures:
 - `isError=true`
@@ -651,7 +678,7 @@ MCP Host (MCP client)
         | stdio JSON-RPC (MCP)
         v
   mcp-beam (single process)
-  - internal/mcpserver   (initialize, tools/list, tools/call)
+  - internal/mcpserver   (server/discover, initialize, tools/list, tools/call)
   - internal/discovery   (unified DLNA + Chromecast discovery)
   - internal/beam        (session manager + lifecycle + cleanup)
         |
