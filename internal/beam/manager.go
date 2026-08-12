@@ -1852,14 +1852,18 @@ func (m *Manager) resolveSeekPosition(ctx context.Context, sess *session, req do
 		}
 
 		resolved := current + *req.DeltaSeconds
-		if resolved < 0 {
-			resolved = 0
-		}
 		if duration > 0 {
+			// A duration large enough to overflow the conversion yields a
+			// negative ceiling, so clamp to the floor afterwards rather than
+			// before: otherwise the ceiling could drag resolved below zero and
+			// send a negative position to the device.
 			maxSeconds := int(math.Round(duration))
 			if resolved > maxSeconds {
 				resolved = maxSeconds
 			}
+		}
+		if resolved < 0 {
+			resolved = 0
 		}
 		return resolved, duration, seekModeDeltaSeconds, nil
 	}
