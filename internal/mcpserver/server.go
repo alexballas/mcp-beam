@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go2tv.app/mcp-beam/internal/domain"
@@ -55,6 +56,22 @@ type Server struct {
 	beamController      BeamController
 	sendMu              sync.Mutex
 	inflightTools       sync.WaitGroup
+
+	// modernEra records whether the request being served proved itself modern.
+	// It is set once per request before dispatch and read on the send path,
+	// which is what keeps modern-only fields out of a legacy client's results.
+	// Atomic because `tools/call` results are sent from their own goroutines.
+	//
+	// Determining this per request rather than latching it per process gives
+	// the same answer for any conformant client -- the spec makes the era a
+	// property of the server that a client detects once and caches, so a client
+	// does not interleave eras on one stdio process -- while still defaulting a
+	// request that never identified itself to the legacy shape.
+	modernEra atomic.Bool
+
+	// resultMeta is the server identity stamped into each modern result. Name
+	// and version are immutable after New, so it is built once.
+	resultMeta map[string]any
 }
 
 type Config struct {
@@ -82,6 +99,12 @@ func New(in io.Reader, out io.Writer, cfg Config) *Server {
 		tools:               staticTools(),
 		localHardwareLister: cfg.LocalHardwareLister,
 		beamController:      cfg.BeamController,
+		resultMeta: map[string]any{
+			metaServerInfo: map[string]string{
+				"name":    cfg.ServerName,
+				"version": cfg.ServerVersion,
+			},
+		},
 	}
 }
 
@@ -179,6 +202,13 @@ func (s *Server) handle(ctx context.Context, payload []byte) error {
 		}
 	}
 
+	// Having survived validation, the request is modern only if it carried
+	// modern `_meta`, or is the modern-only `server/discover`. An `initialize`
+	// handshake selects legacy semantics however it is dressed, and a request
+	// that identified itself as neither is served the legacy shape: it cannot
+	// be a valid modern request, which must always carry `_meta`.
+	s.modernEra.Store(req.Method == "server/discover" || (req.Method != "initialize" && meta.isModern()))
+
 	switch req.Method {
 	case "initialize":
 		s.logCall("initialize", "", "", startedAt, "")
@@ -197,16 +227,10 @@ func (s *Server) handle(ctx context.Context, payload []byte) error {
 			SupportedVersions: supportedProtocolVersions,
 			Capabilities:      serverCapabilities(),
 			Instructions:      serverInstructions,
-			TTLMs:             staticListTTLMs,
-			CacheScope:        cacheScopePublic,
 		}})
 	case "tools/list":
 		s.logCall("tools/list", "", "", startedAt, "")
-		return s.send(response{JSONRPC: "2.0", ID: req.ID, Result: toolsListResult{
-			Tools:      s.tools,
-			TTLMs:      staticListTTLMs,
-			CacheScope: cacheScopePublic,
-		}})
+		return s.send(response{JSONRPC: "2.0", ID: req.ID, Result: toolsListResult{Tools: s.tools}})
 	case "tools/call":
 		toolID := append(json.RawMessage(nil), req.ID...)
 		toolParams := append(json.RawMessage(nil), req.Params...)
@@ -777,32 +801,37 @@ func serverCapabilities() map[string]any {
 	}
 }
 
-func (s *Server) resultMeta() map[string]any {
-	return map[string]any{
-		metaServerInfo: map[string]string{
-			"name":    s.serverName,
-			"version": s.serverVersion,
-		},
-	}
-}
-
 // finalizeResult stamps the fields every modern result carries: the mandatory
-// `resultType` and the recommended server identity. Applying it centrally in
-// the send path is what guarantees no handler can omit them. Legacy-only
-// results (initializeResult) are not listed and pass through untouched.
+// `resultType`, the cache hints required of a CacheableResult, and the
+// recommended server identity. Applying it centrally in the send path is what
+// guarantees no handler can omit them.
+//
+// On a legacy exchange results are handed back untouched, so a legacy client
+// sees only its own revision's shape: the modern-only fields are all omitempty
+// and stay absent.
 func (s *Server) finalizeResult(result any) any {
+	if !s.modernEra.Load() {
+		return result
+	}
+
+	ttl := staticListTTLMs
+
 	switch typed := result.(type) {
 	case discoverResult:
 		typed.ResultType = resultTypeComplete
-		typed.Meta = s.resultMeta()
+		typed.TTLMs = &ttl
+		typed.CacheScope = cacheScopePublic
+		typed.Meta = s.resultMeta
 		return typed
 	case toolsListResult:
 		typed.ResultType = resultTypeComplete
-		typed.Meta = s.resultMeta()
+		typed.TTLMs = &ttl
+		typed.CacheScope = cacheScopePublic
+		typed.Meta = s.resultMeta
 		return typed
 	case toolCallResult:
 		typed.ResultType = resultTypeComplete
-		typed.Meta = s.resultMeta()
+		typed.Meta = s.resultMeta
 		return typed
 	default:
 		return result

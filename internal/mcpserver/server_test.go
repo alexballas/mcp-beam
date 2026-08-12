@@ -2154,3 +2154,145 @@ func readResponses(t *testing.T, output []byte) []map[string]any {
 
 	return responses
 }
+
+// modernOnlyResultFields are the fields the 2026-07-28 revision adds to results.
+// A legacy client negotiated a revision that defines none of them, so none may
+// appear in anything it is served after the `initialize` handshake.
+var modernOnlyResultFields = []string{"resultType", "ttlMs", "cacheScope", "_meta"}
+
+// After an `initialize` handshake selects legacy semantics, every later result
+// must stay within the legacy revision's shape. Without era selection the send
+// path stamps modern fields onto results regardless of who asked for them.
+func TestLegacyEraResultsCarryNoModernFields(t *testing.T) {
+	input := bytes.NewBuffer(nil)
+	output := bytes.NewBuffer(nil)
+
+	writeRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "initialize",
+		"params":  map[string]any{},
+	})
+	writeRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "tools/list",
+	})
+	writeRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      3,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name":      "list_local_hardware",
+			"arguments": map[string]any{},
+		},
+	})
+
+	srv := New(input, output, Config{
+		ServerName:          "mcp-beam",
+		ServerVersion:       "1.0.0-test",
+		LocalHardwareLister: &fakeLocalHardwareLister{},
+	})
+	if err := srv.Run(context.Background()); err != nil {
+		t.Fatalf("run server: %v", err)
+	}
+
+	responses := readResponses(t, output.Bytes())
+	if len(responses) != 3 {
+		t.Fatalf("expected 3 responses, got %d", len(responses))
+	}
+
+	for _, response := range responses {
+		result, ok := response["result"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected a result, got %#v", response)
+		}
+		for _, field := range modernOnlyResultFields {
+			if _, exists := result[field]; exists {
+				t.Fatalf("legacy result for id %#v must not carry %q: %#v", response["id"], field, result)
+			}
+		}
+	}
+
+	// The legacy payloads themselves must survive intact.
+	if len(responses[1]["result"].(map[string]any)["tools"].([]any)) != 7 {
+		t.Fatalf("legacy tools/list must still list every tool")
+	}
+	if len(responses[2]["result"].(map[string]any)["content"].([]any)) == 0 {
+		t.Fatalf("legacy tools/call must still carry content")
+	}
+}
+
+// A legacy client that never sends `initialize` -- calling tools/list directly
+// with no `_meta` -- is still an era-ambiguous request served under legacy
+// semantics, so it must not be handed modern-only fields either.
+func TestRequestWithoutMetaCarriesNoModernFields(t *testing.T) {
+	input := bytes.NewBuffer(nil)
+	output := bytes.NewBuffer(nil)
+
+	writeRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "tools/list",
+	})
+
+	srv := New(input, output, Config{ServerName: "mcp-beam", ServerVersion: "1.0.0-test"})
+	if err := srv.Run(context.Background()); err != nil {
+		t.Fatalf("run server: %v", err)
+	}
+
+	responses := readResponses(t, output.Bytes())
+	if len(responses) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(responses))
+	}
+
+	result := responses[0]["result"].(map[string]any)
+	if len(result["tools"].([]any)) != 7 {
+		t.Fatalf("tools/list must list every tool: %#v", result)
+	}
+	if _, exists := result["resultType"]; exists {
+		t.Fatalf("an era-ambiguous result must not carry resultType: %#v", result)
+	}
+}
+
+// `server/discover` exists solely in the modern revision and always carries
+// modern `_meta`, so it keeps its modern shape even on a process that has
+// already answered a legacy `initialize`.
+func TestServerDiscoverStaysModernAfterLegacyInitialize(t *testing.T) {
+	input := bytes.NewBuffer(nil)
+	output := bytes.NewBuffer(nil)
+
+	writeJSONLineRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "initialize",
+		"params":  map[string]any{},
+	})
+	writeJSONLineRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "server/discover",
+		"params":  map[string]any{"_meta": modernMeta()},
+	})
+
+	srv := New(input, output, Config{ServerName: "mcp-beam", ServerVersion: "1.0.0-test"})
+	if err := srv.Run(context.Background()); err != nil {
+		t.Fatalf("run server: %v", err)
+	}
+
+	responses := readResponses(t, output.Bytes())
+	if len(responses) != 2 {
+		t.Fatalf("expected 2 responses, got %d", len(responses))
+	}
+
+	discover := responses[1]["result"].(map[string]any)
+	if discover["resultType"].(string) != "complete" {
+		t.Fatalf("server/discover must stay modern: %#v", discover)
+	}
+	if discover["ttlMs"].(float64) <= 0 || discover["cacheScope"].(string) != "public" {
+		t.Fatalf("server/discover must keep its cache hints: %#v", discover)
+	}
+	if _, exists := discover["_meta"]; !exists {
+		t.Fatalf("server/discover must keep serverInfo: %#v", discover)
+	}
+}

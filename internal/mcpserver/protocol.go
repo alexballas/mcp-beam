@@ -8,7 +8,10 @@ import (
 // Protocol revisions this server speaks. The modern revision carries version,
 // identity and capabilities as per-request `_meta`; the legacy revision
 // establishes them once through the `initialize` handshake. Both are served
-// concurrently: the era is selected per request, not per process.
+// concurrently, and the era is selected from what each request carries: only a
+// request bearing modern `_meta` (or the modern-only `server/discover`) is
+// answered in the modern shape, so a legacy client is served entirely within
+// its own revision.
 const (
 	protocolVersionModern = "2026-07-28"
 	protocolVersionLegacy = "2024-11-05"
@@ -122,21 +125,26 @@ type initializeResult struct {
 	Instructions    string            `json:"instructions,omitempty"`
 }
 
+// The modern-only fields below are omitempty so that a legacy result can carry
+// none of them. `ttlMs` is a pointer because 0 is a legal modern value that
+// omitempty would otherwise drop; `resultType` and `cacheScope` are never
+// legitimately empty in the modern era, so a bare string suffices. Only
+// finalizeResult populates them, and only for a modern exchange.
 type discoverResult struct {
-	ResultType        string         `json:"resultType"`
+	ResultType        string         `json:"resultType,omitempty"`
 	SupportedVersions []string       `json:"supportedVersions"`
 	Capabilities      map[string]any `json:"capabilities"`
 	Instructions      string         `json:"instructions,omitempty"`
-	TTLMs             int            `json:"ttlMs"`
-	CacheScope        string         `json:"cacheScope"`
+	TTLMs             *int           `json:"ttlMs,omitempty"`
+	CacheScope        string         `json:"cacheScope,omitempty"`
 	Meta              map[string]any `json:"_meta,omitempty"`
 }
 
 type toolsListResult struct {
-	ResultType string         `json:"resultType"`
+	ResultType string         `json:"resultType,omitempty"`
 	Tools      []tool         `json:"tools"`
-	TTLMs      int            `json:"ttlMs"`
-	CacheScope string         `json:"cacheScope"`
+	TTLMs      *int           `json:"ttlMs,omitempty"`
+	CacheScope string         `json:"cacheScope,omitempty"`
 	Meta       map[string]any `json:"_meta,omitempty"`
 }
 
@@ -152,7 +160,7 @@ type toolsCallParams struct {
 }
 
 type toolCallResult struct {
-	ResultType        string         `json:"resultType"`
+	ResultType        string         `json:"resultType,omitempty"`
 	Content           []toolContent  `json:"content"`
 	StructuredContent any            `json:"structuredContent,omitempty"`
 	IsError           bool           `json:"isError,omitempty"`

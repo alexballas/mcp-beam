@@ -344,7 +344,7 @@ Notes for `2026-07-28` clients:
 - `server/discover` and `tools/list` are cacheable and carry `ttlMs` and `cacheScope`.
 - Results are always `resultType: "complete"`. `mcp-beam` never returns `input_required`: it needs no sampling, elicitation, or roots.
 
-The `session_id` returned by `beam_media` is the explicit handle the stateless model calls for. Sessions are process-local and do not survive a restart; see [Session lifecycle defaults](#architecture) for how long they are retained.
+The `session_id` returned by `beam_media` is the explicit handle the stateless model calls for. Sessions are process-local and do not survive a restart; see the session lifecycle defaults under [Architecture](#architecture) for how long they are retained.
 
 ## Tool Reference
 
