@@ -1708,3 +1708,72 @@ func readResponses(t *testing.T, output []byte) []map[string]any {
 
 	return responses
 }
+
+// A magnitude past int range converts to a large negative number. Every mode
+// must reject it up front: delta_seconds in particular applies no range check
+// of its own, so the converted value would survive as far as the position
+// arithmetic and clamp into a seek back to the start of the media.
+func TestToolsCallSeekBeamingRejectsOutOfRangeValue(t *testing.T) {
+	for _, mode := range []string{"absolute_seconds", "percent", "from_end_seconds", "delta_seconds"} {
+		t.Run(mode, func(t *testing.T) {
+			input := bytes.NewBuffer(nil)
+			output := bytes.NewBuffer(nil)
+
+			writeRequest(t, input, map[string]any{
+				"jsonrpc": "2.0",
+				"id":      91,
+				"method":  "tools/call",
+				"params": map[string]any{
+					"name": "seek_beaming",
+					"arguments": map[string]any{
+						"session_id": "sess_seek_1",
+						"mode":       mode,
+						"value":      1e20,
+					},
+				},
+			})
+
+			controller := &fakeBeamController{}
+			srv := New(input, output, Config{BeamController: controller})
+			if err := srv.Run(context.Background()); err != nil {
+				t.Fatalf("run server: %v", err)
+			}
+
+			responses := readResponses(t, output.Bytes())
+			if len(responses) != 1 {
+				t.Fatalf("expected 1 response, got %d", len(responses))
+			}
+			errObj, isError := responses[0]["error"].(map[string]any)
+			if !isError {
+				t.Fatalf("expected an error response, got %#v", responses[0])
+			}
+			if errObj["code"].(float64) != -32602 {
+				t.Fatalf("expected -32602, got %v", errObj["code"])
+			}
+
+			// The seek must be rejected before it can reach the device.
+			controller.mu.Lock()
+			defer controller.mu.Unlock()
+			if controller.seekReq.SessionID != "" {
+				t.Fatalf("controller must not be called: %#v", controller.seekReq)
+			}
+		})
+	}
+}
+
+// The schema must advertise the same bound the handler enforces, so a model
+// sees the limit rather than discovering it through a rejected call.
+func TestSeekBeamingSchemaBoundsValue(t *testing.T) {
+	for _, entry := range staticTools() {
+		if entry.Name != "seek_beaming" {
+			continue
+		}
+		properties := entry.InputSchema["properties"].(map[string]any)
+		value := properties["value"].(map[string]any)
+		if value["minimum"] != -maxSeekSeconds || value["maximum"] != maxSeekSeconds {
+			t.Fatalf("value must be bounded by +/-maxSeekSeconds: %#v", value)
+		}
+		return
+	}
+	t.Fatal("seek_beaming tool not found")
+}

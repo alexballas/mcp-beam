@@ -25,6 +25,12 @@ const (
 	transcodeAlways           = "always"
 	transcodeNever            = "never"
 	inflightDrainTimeout      = 2 * time.Second
+
+	// maxSeekSeconds bounds every seconds-valued seek mode. A year is far
+	// beyond any real media duration, and staying well inside int32 keeps the
+	// float -> int conversions in handleSeekBeamingCall safe even where int is
+	// 32 bits.
+	maxSeekSeconds = 365 * 24 * 60 * 60
 )
 
 type LocalHardwareLister interface {
@@ -516,6 +522,16 @@ func (s *Server) handleSeekBeamingCall(ctx context.Context, id json.RawMessage, 
 		SessionID:    sessionID,
 	}
 	value := *args.Value
+
+	// Bound the magnitude before the float -> int conversions below: a value
+	// beyond int range converts to a large negative number, which delta_seconds
+	// does not range-check and would clamp into a seek back to the start.
+	// Written as a range test so that a NaN, which compares false against
+	// everything, is rejected here rather than converted.
+	if !(value >= -maxSeekSeconds && value <= maxSeekSeconds) {
+		return s.sendInvalidParams("seek_beaming", targetDevice, sessionID, startedAt, id)
+	}
+
 	switch *args.Mode {
 	case "absolute_seconds":
 		if value < 0 {
@@ -1004,7 +1020,9 @@ func staticTools() []tool {
 							"For an exact timestamp use 'absolute_seconds'; for skip/rewind use 'delta_seconds'.",
 					},
 					"value": map[string]any{
-						"type": "number",
+						"type":    "number",
+						"minimum": -maxSeekSeconds,
+						"maximum": maxSeekSeconds,
 						"description": "The seek amount, interpreted by 'mode'. " +
 							"absolute_seconds: whole seconds from the start, 0 or greater (e.g. 4140 for 1:09:00). " +
 							"percent: 0 to 100 (e.g. 50 for the middle). " +
