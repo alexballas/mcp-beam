@@ -907,8 +907,12 @@ func staticTools() []tool {
 			},
 		},
 		{
-			Name:        "beam_media",
-			Description: "Cast or stream media (video, audio, etc.) to a selected local Smart TV, Chromecast, or UPnP/DLNA device. You must provide a valid target_device ID or name.",
+			Name: "beam_media",
+			Description: "Cast or stream media (video, audio, etc.) to a selected local Smart TV, Chromecast, or UPnP/DLNA device. " +
+				"You must provide a valid target_device ID or name. " +
+				"Returns a session_id accepted by the other beaming tools. Sessions live only in this server process: they are lost if it restarts, " +
+				"and are reclaimed automatically after about 10 minutes idle or stalled, 90 minutes paused, or 24 hours in total. " +
+				"If a session_id is no longer recognized, start a new beam rather than retrying with it.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
