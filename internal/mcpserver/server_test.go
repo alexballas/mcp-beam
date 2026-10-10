@@ -28,28 +28,38 @@ type fakeLocalHardwareLister struct {
 }
 
 type fakeBeamController struct {
-	mu           sync.Mutex
-	beamReq      domain.BeamRequest
-	beamResult   *domain.BeamResult
-	beamErr      error
-	stopReq      domain.StopRequest
-	stopResult   *domain.StopResult
-	stopErr      error
-	playReq      domain.PlaybackControlRequest
-	playResult   *domain.PlaybackControlResult
-	playErr      error
-	pauseReq     domain.PlaybackControlRequest
-	pauseResult  *domain.PlaybackControlResult
-	pauseErr     error
-	seekReq      domain.SeekRequest
-	seekResult   *domain.SeekResult
-	seekErr      error
-	statusReq    domain.StatusRequest
-	statusResult *domain.StatusResult
-	statusErr    error
-	beamBlock    <-chan struct{}
-	beamCalled   chan struct{}
-	beamOnce     sync.Once
+	mu            sync.Mutex
+	beamReq       domain.BeamRequest
+	beamResult    *domain.BeamResult
+	beamErr       error
+	stopReq       domain.StopRequest
+	stopResult    *domain.StopResult
+	stopErr       error
+	playReq       domain.PlaybackControlRequest
+	playResult    *domain.PlaybackControlResult
+	playErr       error
+	pauseReq      domain.PlaybackControlRequest
+	pauseResult   *domain.PlaybackControlResult
+	pauseErr      error
+	seekReq       domain.SeekRequest
+	seekResult    *domain.SeekResult
+	seekErr       error
+	statusReq     domain.StatusRequest
+	statusResult  *domain.StatusResult
+	statusErr     error
+	beamBlock     <-chan struct{}
+	beamCalled    chan struct{}
+	beamOnce      sync.Once
+	inspectReq    domain.InspectTorrentRequest
+	inspectResult *domain.InspectTorrentResult
+	inspectErr    error
+}
+
+func (f *fakeBeamController) InspectTorrent(ctx context.Context, req domain.InspectTorrentRequest) (*domain.InspectTorrentResult, error) {
+	f.mu.Lock()
+	f.inspectReq = req
+	f.mu.Unlock()
+	return f.inspectResult, f.inspectErr
 }
 
 func (f *fakeBeamController) BeamMedia(ctx context.Context, req domain.BeamRequest) (*domain.BeamResult, error) {
@@ -150,8 +160,8 @@ func TestInitializeAndToolsList(t *testing.T) {
 
 	toolResult := responses[1]["result"].(map[string]any)
 	tools := toolResult["tools"].([]any)
-	if len(tools) != 7 {
-		t.Fatalf("expected 7 tools, got %d", len(tools))
+	if len(tools) != 8 {
+		t.Fatalf("expected 8 tools, got %d", len(tools))
 	}
 }
 
@@ -791,6 +801,127 @@ func TestToolsCallCanRunConcurrently(t *testing.T) {
 	}
 	if !seen[81] || !seen[82] {
 		t.Fatalf("expected responses for ids 81 and 82, got %+v", seen)
+	}
+}
+
+func TestConcurrentToolCallsPreserveProtocolEra(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		modern bool
+		err    error
+	}{
+		{name: "modern_success", modern: true},
+		{name: "legacy_success"},
+		{name: "modern_error", modern: true, err: &domain.ToolError{Code: "FILE_NOT_FOUND", Message: "missing media"}},
+		{name: "legacy_error", err: &domain.ToolError{Code: "FILE_NOT_FOUND", Message: "missing media"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			output := &bytes.Buffer{}
+			called := make(chan struct{})
+			release := make(chan struct{})
+			controller := &fakeBeamController{
+				beamResult: &domain.BeamResult{OK: true, SessionID: "sess_slow", DeviceID: "dev_slow"},
+				beamErr:    tc.err,
+				beamCalled: called,
+				beamBlock:  release,
+			}
+			srv := New(&bytes.Buffer{}, output, Config{
+				ServerName:     "mcp-beam",
+				ServerVersion:  "1.0.0-test",
+				BeamController: controller,
+			})
+			var releaseOnce sync.Once
+			releaseCall := func() { releaseOnce.Do(func() { close(release) }) }
+			t.Cleanup(func() {
+				releaseCall()
+				srv.inflightTools.Wait()
+			})
+
+			callParams := map[string]any{
+				"name": "beam_media",
+				"arguments": map[string]any{
+					"source":        "/tmp/media.mkv",
+					"target_device": "dev_slow",
+				},
+			}
+			if tc.modern {
+				callParams["_meta"] = modernMeta()
+			}
+			call, err := json.Marshal(map[string]any{
+				"jsonrpc": "2.0", "id": "slow", "method": "tools/call", "params": callParams,
+			})
+			if err != nil {
+				t.Fatalf("marshal tool call: %v", err)
+			}
+			if err := srv.handle(context.Background(), call); err != nil {
+				t.Fatalf("handle tool call: %v", err)
+			}
+			select {
+			case <-called:
+			case <-time.After(time.Second):
+				t.Fatal("tool call did not start")
+			}
+
+			// Finish a request from the other era while the tool call is blocked.
+			listParams := map[string]any{}
+			if !tc.modern {
+				listParams["_meta"] = modernMeta()
+			}
+			list, err := json.Marshal(map[string]any{
+				"jsonrpc": "2.0", "id": "later", "method": "tools/list", "params": listParams,
+			})
+			if err != nil {
+				t.Fatalf("marshal tools/list: %v", err)
+			}
+			if err := srv.handle(context.Background(), list); err != nil {
+				t.Fatalf("handle tools/list: %v", err)
+			}
+			releaseCall()
+			srv.inflightTools.Wait()
+
+			responses := readResponses(t, output.Bytes())
+			if len(responses) != 2 {
+				t.Fatalf("expected two responses, got %d", len(responses))
+			}
+			for i, response := range responses {
+				id, modern := "later", !tc.modern
+				if i == 1 {
+					id, modern = "slow", tc.modern
+				}
+				if response["id"] != id {
+					t.Fatalf("expected response for %q, got %#v", id, response)
+				}
+				result, ok := response["result"].(map[string]any)
+				if !ok {
+					t.Fatalf("expected result for %q, got %#v", id, response)
+				}
+				if modern {
+					if result["resultType"] != "complete" {
+						t.Fatalf("modern response for %q must retain resultType: %#v", id, result)
+					}
+					meta, ok := result["_meta"].(map[string]any)
+					if !ok {
+						t.Fatalf("modern response for %q must retain server identity: %#v", id, result)
+					}
+					info, ok := meta[metaServerInfo].(map[string]any)
+					if !ok || info["name"] != "mcp-beam" || info["version"] != "1.0.0-test" {
+						t.Fatalf("unexpected server identity for %q: %#v", id, meta)
+					}
+				} else {
+					for _, field := range modernOnlyResultFields {
+						if _, exists := result[field]; exists {
+							t.Fatalf("legacy response for %q must omit %q: %#v", id, field, result)
+						}
+					}
+				}
+				if id == "slow" {
+					isError, _ := result["isError"].(bool)
+					if isError != (tc.err != nil) {
+						t.Fatalf("unexpected tool error status: %#v", result)
+					}
+				}
+			}
+		})
 	}
 }
 
@@ -1817,8 +1948,8 @@ func TestModernToolsListCarriesResultTypeAndCachingHints(t *testing.T) {
 	if result["resultType"].(string) != "complete" {
 		t.Fatalf("resultType mismatch: %#v", result["resultType"])
 	}
-	if len(result["tools"].([]any)) != 7 {
-		t.Fatalf("expected 7 tools, got %d", len(result["tools"].([]any)))
+	if len(result["tools"].([]any)) != 8 {
+		t.Fatalf("expected 8 tools, got %d", len(result["tools"].([]any)))
 	}
 	if result["ttlMs"].(float64) <= 0 {
 		t.Fatalf("ttlMs must be a positive freshness hint: %#v", result["ttlMs"])
@@ -2039,7 +2170,7 @@ func TestLegacyInitializeIsUnaffectedByModernValidation(t *testing.T) {
 		t.Fatalf("legacy initialize must not carry resultType: %#v", initResult)
 	}
 
-	if len(responses[1]["result"].(map[string]any)["tools"].([]any)) != 7 {
+	if len(responses[1]["result"].(map[string]any)["tools"].([]any)) != 8 {
 		t.Fatalf("legacy tools/list must still list every tool")
 	}
 }
@@ -2215,7 +2346,7 @@ func TestLegacyEraResultsCarryNoModernFields(t *testing.T) {
 	}
 
 	// The legacy payloads themselves must survive intact.
-	if len(responses[1]["result"].(map[string]any)["tools"].([]any)) != 7 {
+	if len(responses[1]["result"].(map[string]any)["tools"].([]any)) != 8 {
 		t.Fatalf("legacy tools/list must still list every tool")
 	}
 	if len(responses[2]["result"].(map[string]any)["content"].([]any)) == 0 {
@@ -2247,7 +2378,7 @@ func TestRequestWithoutMetaCarriesNoModernFields(t *testing.T) {
 	}
 
 	result := responses[0]["result"].(map[string]any)
-	if len(result["tools"].([]any)) != 7 {
+	if len(result["tools"].([]any)) != 8 {
 		t.Fatalf("tools/list must list every tool: %#v", result)
 	}
 	if _, exists := result["resultType"]; exists {

@@ -16,9 +16,10 @@ type Discovery interface {
 
 // CastClient represents a controllable Chromecast session.
 type CastClient interface {
-	Connect() error
-	Load(mediaURL, contentType, title string, startTime int, duration float64, subtitleURL string, live bool) error
-	LoadOnExisting(mediaURL, contentType, title string, startTime int, duration float64, subtitleURL string, live bool) error
+	ConnectContext(context.Context) error
+	LoadMediaContext(context.Context, castprotocol.LoadRequest) error
+	LoadMediaOnExisting(castprotocol.LoadRequest) error
+	ForceClose() error
 	Play() error
 	Pause() error
 	Seek(seconds int) error
@@ -35,6 +36,7 @@ type CastFactory interface {
 // DLNAPayload represents a DLNA control channel.
 type DLNAPayload interface {
 	SendtoTV(action string) error
+	SendtoTVContext(context.Context, string) error
 	StopPlayback() error
 	SeekSoapCall(reltime string) error
 	GetTransportInfo() ([]string, error)

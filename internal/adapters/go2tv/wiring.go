@@ -49,16 +49,20 @@ type CastClientAdapter struct {
 	client *castprotocol.CastClient
 }
 
-func (c *CastClientAdapter) Connect() error {
-	return c.client.Connect()
+func (c *CastClientAdapter) ConnectContext(ctx context.Context) error {
+	return c.client.ConnectContext(ctx)
 }
 
-func (c *CastClientAdapter) Load(mediaURL, contentType, title string, startTime int, duration float64, subtitleURL string, live bool) error {
-	return c.client.Load(mediaURL, contentType, title, startTime, duration, subtitleURL, live)
+func (c *CastClientAdapter) LoadMediaContext(ctx context.Context, req castprotocol.LoadRequest) error {
+	return c.client.LoadMediaContext(ctx, req)
 }
 
-func (c *CastClientAdapter) LoadOnExisting(mediaURL, contentType, title string, startTime int, duration float64, subtitleURL string, live bool) error {
-	return c.client.LoadOnExisting(mediaURL, contentType, title, startTime, duration, subtitleURL, live)
+func (c *CastClientAdapter) LoadMediaOnExisting(req castprotocol.LoadRequest) error {
+	return c.client.LoadMediaOnExisting(req)
+}
+
+func (c *CastClientAdapter) ForceClose() error {
+	return c.client.ForceClose()
 }
 
 func (c *CastClientAdapter) Play() error {
@@ -102,6 +106,10 @@ type DLNAPayloadAdapter struct {
 
 func (d *DLNAPayloadAdapter) SendtoTV(action string) error {
 	return d.payload.SendtoTV(action)
+}
+
+func (d *DLNAPayloadAdapter) SendtoTVContext(ctx context.Context, action string) error {
+	return d.payload.SendtoTVContext(ctx, action)
 }
 
 func (d *DLNAPayloadAdapter) StopPlayback() error {

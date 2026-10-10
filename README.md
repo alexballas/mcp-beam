@@ -9,10 +9,12 @@
 
 ![mcp-beam demo](./assets/demo.png)
 
-`mcp-beam` is a MCP server (`stdio` transport) for casting local files and media URLs to Chromecast and DLNA/UPnP devices on your LAN. It speaks both the `2026-07-28` and `2024-11-05` protocol revisions.
+`mcp-beam` is a MCP server (`stdio` transport) for casting local files, media URLs, and torrents to Chromecast and DLNA/UPnP devices on your LAN. It speaks both the `2026-07-28` and `2024-11-05` protocol revisions.
 
-It exposes seven tools:
+It exposes eight tools:
+
 - `list_local_hardware`
+- `inspect_torrent`
 - `beam_media`
 - `get_beaming_status`
 - `play_beaming`
@@ -25,6 +27,8 @@ It exposes seven tools:
 - One server for both Chromecast and DLNA/UPnP workflows.
 - Stable device IDs for reliable follow-up calls.
 - Protocol-aware direct play and transcoding decisions.
+- Local `.torrent` and magnet sources with explicit file selection and download progress.
+- External, sidecar, and embedded subtitles with receiver rendering or video burn-in.
 - Safe-by-default path, URL, and bind policies.
 - Structured errors with practical remediation hints.
 
@@ -94,9 +98,10 @@ go run go2tv.app/mcp-beam@latest --self-test
 ### 3) Run the tool flow
 
 1. Call `list_local_hardware` and pick a device `id`.
-2. Call `beam_media` with `source` and `target_device`.
-3. Call `get_beaming_status`, `play_beaming`, `pause_beaming`, or `seek_beaming` as needed.
-4. Call `stop_beaming` when done.
+2. For torrent sources, call `inspect_torrent` and choose a file index when the torrent contains multiple supported media files.
+3. Call `beam_media` with `source` and `target_device`.
+4. Call `get_beaming_status`, `play_beaming`, `pause_beaming`, or `seek_beaming` as needed.
+5. Call `stop_beaming` when done.
 
 Minimal example flow:
 
@@ -281,6 +286,7 @@ MCP config for a local binary:
 - Downloaded release binaries do not require a local Go installation.
 - `ffmpeg` and `ffprobe` are optional for non-transcoding paths, but recommended.
   - If transcoding is required and `ffmpeg` is unavailable, calls return `FFMPEG_NOT_FOUND`.
+  - Local embedded subtitle selection and ASS/SSA subtitle conversion also require FFmpeg.
 
 ### Go Installation
 
@@ -338,6 +344,10 @@ Methods:
 | `initialize` | `2024-11-05` |
 | `tools/list`, `tools/call` | both |
 
+For stdio, cancel an in-progress tool call with a `notifications/cancelled` notification whose `params.requestId` matches the call's JSON-RPC ID. Cancellation stops work through the call's context and suppresses its response. Malformed notifications and unknown or completed IDs are ignored. A cancellation that arrives after a response has started may still receive that response.
+
+When stdin closes, the server allows in-progress calls two seconds to finish, then cancels outstanding work before shutdown.
+
 Notes for `2026-07-28` clients:
 - Every request must carry `io.modelcontextprotocol/protocolVersion` and `io.modelcontextprotocol/clientCapabilities` in `params._meta`. A missing field is `-32602`.
 - An unsupported version returns `-32022` with `data.supported` listing the versions to retry with.
@@ -382,15 +392,45 @@ On success, `structuredContent` includes:
 - `capabilities.supports_hls_m3u8_url`
 - `capabilities.limitations[]`
 
+### `inspect_torrent`
+
+Inspect the file list in a local `.torrent` file or magnet URI before casting. This does not start playback.
+
+Arguments:
+
+- `source` (required string): absolute local `.torrent` path or magnet URI
+- `timeout_ms` (optional integer, `1000` to `120000`, default `60000`): timeout for torrent preparation and metadata retrieval
+
+Example:
+
+```json
+{
+  "name": "inspect_torrent",
+  "arguments": {
+    "source": "/absolute/path/to/movie.torrent",
+    "timeout_ms": 60000
+  }
+}
+```
+
+On success, `structuredContent` contains `ok` and `files[]` for supported media files. Each file contains `index` (its original zero-based torrent file index), `name`, and `size_bytes`. For a torrent containing multiple supported media files, select the desired media file and pass its `index` as `beam_media.arguments.torrent_file_index`. The index can be omitted when the torrent contains exactly one supported media file.
+
+The text content also lists each supported file's original `index`, quoted `name`, and `size_bytes`, so clients that read only text can select a file. An empty list reports that the torrent contains no supported media files to beam.
+
+Magnet URIs require peers to retrieve metadata. Increase `timeout_ms` when retrieval is slow; this timeout applies only to inspection. `beam_media` gives metadata retrieval 60 seconds. Later media preparation and device startup have separate timeouts, so the full call can take longer.
+
 ### `beam_media`
 
 Start playback on a selected discovered device.
 
 Arguments:
-- `source` (required string): absolute local file path, or `http`/`https` URL
+- `source` (required string): absolute local media path, `http`/`https` media URL, absolute local `.torrent` path, or magnet URI
 - `target_device` (required string): stable device ID preferred, exact name fallback
 - `transcode` (optional string): `auto` (default), `always`, `never`
-- `subtitles_path` (optional string): absolute local subtitle file path (`.srt` or `.vtt`)
+- `subtitles_path` (optional string): absolute local external subtitle file path (`.srt`, `.vtt`, `.ass`, or `.ssa`); takes precedence over sidecar and embedded subtitles
+- `torrent_file_index` (optional integer, minimum `0`): file index from `inspect_torrent`; required when a torrent contains multiple supported media files
+- `subtitle_mode` (optional string): `auto` (default), `receiver`, `burn`, or `off`
+- `embedded_subtitle_track` (optional integer, minimum `0`): zero-based subtitle track index in a local media file
 - `start_seconds` (optional integer, minimum `0`): start offset from the beginning of media
 
 Example:
@@ -415,13 +455,31 @@ On success, `structuredContent` includes:
 - `media_url`
 - `transcoding`
 - `warnings[]`
+- optional `torrent`: `file_index`, `file_name`, `downloaded_bytes`, `total_bytes`, and `progress_percent` for the selected file
+
+Torrent example:
+
+```json
+{
+  "name": "beam_media",
+  "arguments": {
+    "source": "/absolute/path/to/movie.torrent",
+    "torrent_file_index": 1,
+    "target_device": "dev_1234abcd",
+    "subtitle_mode": "auto"
+  }
+}
+```
 
 Protocol notes:
 - Chromecast supports local files and URL sources.
 - Chromecast supports direct `.m3u8` HLS URL casting.
 - DLNA supports local files and URL sources with direct-first then proxy fallback behavior.
 - DLNA `.m3u8` URLs are rejected with structured limitation details.
-- When `subtitles_path` is omitted for local files, mcp-beam auto-detects sidecar subtitles using the same basename (`.srt`, then `.vtt`).
+- When `subtitles_path` is omitted for local files, mcp-beam auto-detects sidecar subtitles using the same basename in this order: `.srt`, `.vtt`, `.ass`, then `.ssa`. An explicit `embedded_subtitle_track` selects that track instead of searching for sidecars.
+- `subtitle_mode=auto` chooses a compatible subtitle rendering path. `receiver` sends subtitles separately to the device and cannot render embedded bitmap tracks. `burn` renders subtitles into the video and implies transcoding; `off` disables subtitles.
+- `embedded_subtitle_track` selects a local embedded track; an explicit `subtitles_path` takes precedence.
+- Torrent metadata retrieval requires available peers and has a 60-second timeout. Media preparation and device startup can take additional time. Torrent downloads remain active during pause and seek. Session resources and private torrent cache are released on stop, replacement, expiry, or server shutdown.
 
 ### `get_beaming_status`
 
@@ -457,6 +515,7 @@ On success, `structuredContent` includes:
 - `media_url`
 - `transcoding`
 - `warnings[]`
+- optional `torrent`: selected file index/name, downloaded bytes, total bytes, and progress percentage
 
 ### `play_beaming`
 
@@ -582,6 +641,8 @@ Examples:
 
 Note:
 - Duration-relative modes (`percent`, `from_end_seconds`) require known media duration.
+- Start offsets, seek positions, and reported playback positions refer to the original media timeline. Transcoded playback restarts its stream at zero and adjusts receiver subtitle cues for the selected source offset.
+- Transcoded HTTP/HTTPS sources reopen the original URL for each renderer request, supporting start offsets and later seeks. Native DLNA proxy requests forward byte ranges to the source.
 
 ## Transcode Behavior
 
@@ -591,7 +652,7 @@ Note:
 - `never`
 
 Behavior summary:
-- `never`: do not transcode.
+- `never`: do not transcode; requesting subtitle burn-in requires transcoding.
 - `always`: force transcoding for video sources; ignored for non-video sources.
 - `auto`: protocol-aware default behavior.
 - Chromecast local files: transcode only when codec compatibility requires it.
@@ -603,6 +664,9 @@ Edge cases:
 - Invalid `transcode` values return JSON-RPC `-32602` (`invalid params`).
 - `transcode=always` with direct Chromecast HLS (`.m3u8`) URLs is rejected.
 - If transcoding is required/requested and `ffmpeg` is unavailable, the call returns `FFMPEG_NOT_FOUND`.
+- `subtitle_mode=burn` enables transcoding with `transcode=auto`; combining it with `transcode=never` returns `TRANSCODE_REQUIRED`. Receiver subtitle rendering supports text subtitles; bitmap subtitle tracks need burn-in.
+- Receiver rendering converts ASS/SSA captions to text and reports a warning that styling is lost. Burn-in preserves styling through FFmpeg.
+- Embedded track selection is limited to local media files. For torrent playback, Chromecast can receive automatically detected progressive text subtitles from MKV/WebM; DLNA cannot automatically send embedded torrent subtitles and returns a warning recommending burn-in.
 - Results include `structuredContent.transcoding` and `warnings[]` so callers can verify what ran.
 
 ## Error Model
@@ -630,6 +694,11 @@ Common tool error codes:
 - `UNSUPPORTED_URL_PATTERN`
 - `TRANSCODE_REQUIRED`
 - `FFMPEG_NOT_FOUND`
+- `INVALID_ARGUMENT` (unsupported argument combinations or source types)
+- `TORRENT_ERROR`
+- `TORRENT_METADATA_TIMEOUT`
+- `TORRENT_FILE_REQUIRED` (includes `details.files` for explicit selection)
+- `TORRENT_FILE_INVALID`
 - `SEEK_MODE_INVALID`
 - `SEEK_POSITION_INVALID`
 - `SEEK_DURATION_UNKNOWN`
@@ -652,7 +721,7 @@ Common tool error codes:
 Security controls:
 - Local file paths must be absolute.
 - Strict path mode enforces allowlisted prefixes and rejects path escapes.
-- Only `http` and `https` URLs are accepted.
+- Media URLs accept `http` and `https`; torrent sources accept local `.torrent` files and magnet URIs.
 - Loopback hosts (`localhost`, `127.0.0.0/8`, `::1`) are blocked by default.
 - Wildcard bind addresses (`0.0.0.0`, `::`) are blocked by default.
 - Temporary media routes use random, unguessable tokens.
@@ -666,7 +735,7 @@ Recommended production baseline:
 
 Threat boundaries:
 - MCP client input is untrusted and validated strictly.
-- Source URL hosts are external trust boundaries.
+- Source URL hosts and torrent peers are external trust boundaries.
 - Media listeners are LAN-visible and should run only on trusted networks.
 - Device control endpoints (Chromecast/DLNA) depend on LAN integrity.
 
@@ -696,11 +765,12 @@ Runtime model:
 
 Core flow:
 1. `list_local_hardware`: discover, normalize, stable IDs, optional reachability filter.
-2. `beam_media`: validate source, resolve target, choose protocol, decide transcode, start playback, persist session.
-3. `get_beaming_status`: query active sessions by `session_id` or `target_device`.
-4. `play_beaming` / `pause_beaming`: resume or pause active sessions by `session_id` or `target_device`.
-5. `seek_beaming`: seek active sessions by `session_id` or `target_device`.
-6. `stop_beaming`: resolve session/device, stop protocol playback, tear down runtime resources.
+2. `inspect_torrent`: retrieve torrent metadata and list file indices without starting playback.
+3. `beam_media`: validate source, prepare a selected torrent file when requested, resolve target, choose subtitle rendering and transcoding, start playback, persist session.
+4. `get_beaming_status`: query active sessions by `session_id` or `target_device`.
+5. `play_beaming` / `pause_beaming`: resume or pause active sessions by `session_id` or `target_device`.
+6. `seek_beaming`: seek active sessions by `session_id` or `target_device`.
+7. `stop_beaming`: resolve session/device, stop protocol playback, tear down runtime resources.
 
 Session lifecycle defaults:
 - `idle_cleanup_after = 10m`
@@ -734,7 +804,10 @@ Common issues:
 - `UNSUPPORTED_URL_PATTERN`: source must be routable `http`/`https`; for local loopback testing only, set `MCP_BEAM_ALLOW_LOOPBACK_URLS=true`.
 - `UNSUPPORTED_SOURCE_FOR_PROTOCOL`: target Chromecast for `.m3u8`.
 - `PROTOCOL_ERROR` with bind policy: use a concrete LAN bind address; set `MCP_BEAM_ALLOW_WILDCARD_BIND=true` only in controlled environments.
-- `invalid params`: remove unknown fields and match exact argument names/types.
+- `invalid params`: remove unknown fields and match exact argument names/types. Torrent and embedded subtitle indices must be nonnegative; inspection timeout must be between `1000` and `120000` milliseconds.
+- `TORRENT_FILE_REQUIRED`: inspect `details.files` or call `inspect_torrent`, then pass the desired index as `torrent_file_index`.
+- `TORRENT_METADATA_TIMEOUT`: check peer availability and network access; retry `inspect_torrent` with a larger `timeout_ms` to inspect slow magnet sources.
+- Bitmap subtitles in `receiver` mode: use `subtitle_mode=burn` and ensure FFmpeg is installed.
 
 Discovery issues:
 - If no devices are returned, increase `timeout_ms`.
@@ -747,6 +820,10 @@ Startup issues:
 - In debug logs, check for `mcp_server_start`, `mcp_read_wait`, `mcp_message_received`.
 
 ## Development
+
+This development snapshot requires Go2TV's public `torrentstream`, `mediasource`, and `castsubtitles` packages, plus its synchronized DLNA control and stream APIs. These changes currently exist in the updated Go2TV checkout and are pending publication. The Go2TV revision presently pinned in `go.mod` (`b7671d87812a`) does not include them, so a build using only the published dependency cannot build this snapshot.
+
+Develop with an updated Go2TV checkout containing these changes through a separate Go workspace. Point `GOWORK` at that workspace when building, and keep temporary checkout paths out of `go.mod`. Before releasing, publish the Go2TV integration changes and pin `go.mod` and `go.sum` to that revision. The module baseline remains Go 1.26; an external development checkout can select a newer toolchain.
 
 Common commands:
 

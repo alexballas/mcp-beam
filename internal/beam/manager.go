@@ -22,7 +22,10 @@ import (
 
 	"go2tv.app/go2tv/v2/castprotocol"
 	"go2tv.app/go2tv/v2/httphandlers"
+	"go2tv.app/go2tv/v2/mediasource"
+	"go2tv.app/go2tv/v2/metadata"
 	"go2tv.app/go2tv/v2/soapcalls"
+	"go2tv.app/go2tv/v2/torrentstream"
 	"go2tv.app/go2tv/v2/utils"
 	"go2tv.app/mcp-beam/internal/adapters"
 	"go2tv.app/mcp-beam/internal/domain"
@@ -65,6 +68,7 @@ type deviceLister interface {
 
 type streamServer interface {
 	AddHandler(path string, payload *soapcalls.TVPayload, transcode *utils.TranscodeOptions, media any)
+	SetDLNATranscodeSeek(payload *soapcalls.TVPayload, seconds int, subsPath string, embedded *utils.EmbeddedSubtitle, subtitleRoute string, subtitles any)
 	StartServing(serverStarted chan<- error)
 	StartServer(serverStarted chan<- error, media, subtitles any, tvpayload *soapcalls.TVPayload, screen httphandlers.Screen)
 	StopServer()
@@ -88,6 +92,9 @@ type Manager struct {
 	lookPath               func(file string) (string, error)
 	listenAddressForDevice func(deviceAddress string) (string, error)
 	prepareURLMedia        func(ctx context.Context, sourceURL string) (any, string, error)
+	openTorrent            func(context.Context, string) (torrentSession, error)
+	torrentContext         context.Context
+	torrentCancel          context.CancelFunc
 
 	dlnaPollEvery time.Duration
 
@@ -139,6 +146,16 @@ type session struct {
 	httpServer   streamServer
 	sourceCloser io.Closer
 	castSeekPlan *chromecastTranscodeSeek
+	dlnaSeekPlan *dlnaSubtitleSeek
+	torrent      *torrentPlayback
+	loadCancel   context.CancelFunc
+	seekOffset   int
+	timelineMu   sync.RWMutex
+	playbackMu   sync.Mutex
+	closed       bool
+	seekCancelMu sync.Mutex
+	seekCancel   context.CancelFunc
+	seekClosing  bool
 
 	monitorCancel context.CancelFunc
 	monitorDone   chan struct{}
@@ -161,49 +178,63 @@ type session struct {
 }
 
 type chromecastTranscodeSeek struct {
-	sourcePath string
-	ffmpegPath string
-	subsPath   string
-	route      string
+	urlSource            bool
+	sourcePath           string
+	ffmpegPath           string
+	subsPath             string
+	route                string
+	subtitleMode         string
+	embeddedTrack        *int
+	torrentSource        mediasource.Source
+	torrentSubtitleRoute string
 }
 
 type preparedPlayback struct {
-	mediaURL      string
-	mediaType     string
-	title         string
-	subtitleURL   string
-	live          bool
-	transcoding   bool
-	mediaDuration float64
-	warnings      []string
-	httpServer    streamServer
-	sourceCloser  io.Closer
-	castSeekPlan  *chromecastTranscodeSeek
+	mediaURL           string
+	mediaType          string
+	title              string
+	subtitleURL        string
+	torrentSubtitleURL string
+	live               bool
+	transcoding        bool
+	mediaDuration      float64
+	warnings           []string
+	httpServer         streamServer
+	sourceCloser       io.Closer
+	castSeekPlan       *chromecastTranscodeSeek
 }
 
 type preparedDLNA struct {
-	mediaURL     string
-	title        string
-	contentType  string
-	transcoding  bool
-	warnings     []string
-	httpServer   streamServer
-	sourceCloser io.Closer
-	payload      adapters.DLNAPayload
-	callbackCh   <-chan string
+	mediaURL      string
+	title         string
+	contentType   string
+	transcoding   bool
+	warnings      []string
+	httpServer    streamServer
+	sourceCloser  io.Closer
+	payload       adapters.DLNAPayload
+	callbackCh    <-chan string
+	mediaDuration float64
+	dlnaSeekPlan  *dlnaSubtitleSeek
 }
 
 func NewManager(discovery deviceLister, castFactory adapters.CastFactory, dlnaFactory adapters.DLNAFactory) *Manager {
 	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
+	torrentCtx, torrentCancel := context.WithCancel(context.Background())
 	allowedPathPrefixes := parseAllowedPathPrefixes(os.Getenv("MCP_BEAM_ALLOWED_PATH_PREFIXES"))
 	manager := &Manager{
-		discovery:                   discovery,
-		castFactory:                 castFactory,
-		dlnaFactory:                 dlnaFactory,
-		serverFactory:               go2TVStreamServerFactory{},
-		lookPath:                    exec.LookPath,
-		listenAddressForDevice:      utils.URLtoListenIPandPort,
-		prepareURLMedia:             utils.PrepareURLMedia,
+		discovery:              discovery,
+		castFactory:            castFactory,
+		dlnaFactory:            dlnaFactory,
+		serverFactory:          go2TVStreamServerFactory{},
+		lookPath:               exec.LookPath,
+		listenAddressForDevice: utils.URLtoListenIPandPort,
+		prepareURLMedia:        utils.PrepareURLMedia,
+		openTorrent: func(ctx context.Context, source string) (torrentSession, error) {
+			return torrentstream.Open(ctx, source)
+		},
+		torrentContext:              torrentCtx,
+		torrentCancel:               torrentCancel,
 		dlnaPollEvery:               dlnaPollInterval,
 		idleCleanupAfter:            defaultIdleCleanupAfter,
 		pausedCleanupAfter:          defaultPausedCleanupAfter,
@@ -230,6 +261,9 @@ func NewManager(discovery deviceLister, castFactory adapters.CastFactory, dlnaFa
 }
 
 func (m *Manager) BeamMedia(ctx context.Context, req domain.BeamRequest) (*domain.BeamResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if m.discovery == nil {
 		return nil, toolError("INTERNAL_ERROR", "beam manager is not configured")
 	}
@@ -240,31 +274,83 @@ func (m *Manager) BeamMedia(ctx context.Context, req domain.BeamRequest) (*domai
 		return nil, toolError("INTERNAL_ERROR", "start_seconds must be >= 0")
 	}
 
-	beamCtx := ctx
-	cancel := func() {}
-	if m.beamOperationTimeout > 0 {
-		beamCtx, cancel = context.WithTimeout(ctx, m.beamOperationTimeout)
-	}
-	defer cancel()
-
 	mode := normalizeTranscodeMode(req.Transcode)
 	if mode == "" {
 		return nil, toolError("INTERNAL_ERROR", "invalid transcode mode")
 	}
 
-	device, err := m.resolveDevice(beamCtx, req.TargetDevice)
+	req.SubtitleMode = strings.ToLower(strings.TrimSpace(req.SubtitleMode))
+	if req.SubtitleMode == "" {
+		req.SubtitleMode = "auto"
+	}
+	switch req.SubtitleMode {
+	case "auto", "receiver", "burn", "off":
+	default:
+		return nil, toolError("INVALID_ARGUMENT", "invalid subtitle_mode")
+	}
+	if req.SubtitleMode == "burn" {
+		if mode == transcodeNever {
+			return nil, toolError("TRANSCODE_REQUIRED", "subtitle_mode=burn requires transcoding")
+		}
+		mode = transcodeAlways
+	}
+	if req.EmbeddedSubtitleTrack != nil && *req.EmbeddedSubtitleTrack < 0 {
+		return nil, toolError("INVALID_ARGUMENT", "embedded_subtitle_track must be non-negative")
+	}
+	if req.TorrentFileIndex != nil && !isTorrentInput(req.Source) {
+		return nil, toolError("INVALID_ARGUMENT", "torrent_file_index requires a magnet URI or .torrent file")
+	}
+	if req.EmbeddedSubtitleTrack != nil && strings.TrimSpace(req.SubtitlesPath) == "" && req.SubtitleMode != "off" && !isTorrentInput(req.Source) {
+		if parsed, err := url.Parse(req.Source); err == nil && parsed.Scheme != "" {
+			return nil, toolError("INVALID_ARGUMENT", "embedded_subtitle_track requires a local media file")
+		}
+	}
+	deviceCtx, cancelDevice := m.operationContext(ctx)
+	device, err := m.resolveDevice(deviceCtx, req.TargetDevice)
+	cancelDevice()
 	if err != nil {
 		return nil, err
 	}
+	var torrent *torrentPlayback
+	if isTorrentInput(req.Source) {
+		torrent, err = m.prepareTorrent(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		req.Source = torrent.path
+	}
+	transferred := false
+	defer func() {
+		if torrent != nil && !transferred {
+			_ = torrent.Close()
+		}
+	}()
 
+	var result *domain.BeamResult
 	switch device.Protocol {
 	case "chromecast":
-		return m.beamChromecast(beamCtx, req, device, mode)
+		result, err = m.beamChromecast(ctx, req, device, mode, torrent)
 	case "dlna":
-		return m.beamDLNA(beamCtx, req, device, mode)
+		result, err = m.beamDLNA(ctx, req, device, mode, torrent)
 	default:
 		return nil, unsupportedProtocolError(device.Protocol)
 	}
+	transferred = err == nil
+	return result, err
+}
+
+func (m *Manager) operationContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if m.beamOperationTimeout > 0 {
+		return context.WithTimeout(ctx, m.beamOperationTimeout)
+	}
+	return context.WithCancel(ctx)
+}
+
+func (m *Manager) preparationContext(ctx context.Context, torrent *torrentPlayback) (context.Context, context.CancelFunc) {
+	if torrent != nil {
+		return context.WithTimeout(ctx, time.Minute)
+	}
+	return m.operationContext(ctx)
 }
 
 func (m *Manager) StopBeaming(_ context.Context, req domain.StopRequest) (*domain.StopResult, error) {
@@ -464,8 +550,12 @@ func (m *Manager) SeekBeaming(ctx context.Context, req domain.SeekRequest) (*dom
 		}
 
 		observedAt := m.now()
+		observedPosition := resolvedSeconds
+		if sess.Transcoding {
+			observedPosition = 0
+		}
 		sess.stateMu.Lock()
-		sess.recordObservationLocked("playing", strconv.Itoa(resolvedSeconds), observedAt)
+		sess.recordObservationLocked("playing", strconv.Itoa(observedPosition), observedAt)
 		sess.stateMu.Unlock()
 	case "dlna":
 		if sess.dlnaPayload == nil {
@@ -475,7 +565,7 @@ func (m *Manager) SeekBeaming(ctx context.Context, req domain.SeekRequest) (*dom
 		reltime := utils.SecondsToClockTime(resolvedSeconds)
 
 		if sess.Transcoding {
-			if err := m.seekDLNATranscoded(ctx, sess, resolvedSeconds, reltime); err != nil {
+			if err := m.seekDLNATranscoded(ctx, sess, resolvedSeconds); err != nil {
 				return nil, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to seek DLNA transcoded playback: %v", err))
 			}
 		} else {
@@ -487,6 +577,9 @@ func (m *Manager) SeekBeaming(ctx context.Context, req domain.SeekRequest) (*dom
 		}
 
 		observedAt := m.now()
+		if sess.Transcoding {
+			reltime = utils.SecondsToClockTime(0)
+		}
 		sess.stateMu.Lock()
 		sess.lastDLNAPosition = reltime
 		sess.recordObservationLocked("playing", reltime, observedAt)
@@ -591,77 +684,111 @@ func (m *Manager) GetBeamingStatus(ctx context.Context, req domain.StatusRequest
 		return nil, unsupportedProtocolError(sess.Protocol)
 	}
 
+	if result.PositionSeconds != nil {
+		position, duration := sess.sourceTimeline(*result.PositionSeconds, valueOrZero(result.DurationSeconds))
+		result.PositionSeconds = float64Ptr(position)
+		if duration > 0 {
+			result.DurationSeconds = float64Ptr(duration)
+		}
+	} else if sess.Transcoding && sess.mediaDuration > 0 {
+		result.DurationSeconds = float64Ptr(sess.mediaDuration)
+	}
 	return result, nil
 }
 
-func (m *Manager) seekChromecastTranscoded(ctx context.Context, sess *session, resolvedSeconds int) error {
-	if sess == nil || sess.castClient == nil {
-		return errors.New("chromecast session is not configured")
+func valueOrZero(value *float64) float64 {
+	if value == nil {
+		return 0
 	}
-	if sess.castSeekPlan == nil {
-		return errors.New("transcoded seek is unsupported for this chromecast session")
-	}
-	if sess.httpServer == nil {
-		return errors.New("stream server is not configured")
-	}
-
-	parsedMediaURL, err := url.Parse(sess.MediaURL)
-	if err != nil || parsedMediaURL.Host == "" {
-		return fmt.Errorf("invalid session media url: %s", sess.MediaURL)
-	}
-
-	plan := sess.castSeekPlan
-	sess.httpServer.AddHandler(plan.route, nil, &utils.TranscodeOptions{
-		FFmpegPath:   plan.ffmpegPath,
-		SubsPath:     plan.subsPath,
-		SeekSeconds:  resolvedSeconds,
-		SubtitleSize: utils.SubtitleSizeMedium,
-	}, plan.sourcePath)
-
-	mediaURL := "http://" + parsedMediaURL.Host + plan.route
-	loadResultCh := make(chan error, 1)
-	go func() {
-		loadResultCh <- sess.castClient.LoadOnExisting(mediaURL, "video/mp4", sess.Title, 0, sess.mediaDuration, "", false)
-	}()
-
-	if err := m.waitForChromecastPlaybackStart(ctx, sess.castClient, loadResultCh); err != nil {
-		return err
-	}
-
-	sess.MediaURL = mediaURL
-	return nil
+	return *value
 }
 
-func (m *Manager) seekDLNATranscoded(ctx context.Context, sess *session, resolvedSeconds int, reltime string) error {
+func (s *session) sourceTimeline(position, duration float64) (float64, float64) {
+	if !s.Transcoding {
+		return position, duration
+	}
+	s.timelineMu.RLock()
+	offset := s.seekOffset
+	s.timelineMu.RUnlock()
+	position += float64(offset)
+	if s.mediaDuration > 0 {
+		duration = s.mediaDuration
+	} else if duration > 0 {
+		duration += float64(offset)
+	}
+	return position, duration
+}
+
+func (s *session) streamURL() string {
+	s.timelineMu.RLock()
+	defer s.timelineMu.RUnlock()
+	return s.MediaURL
+}
+
+func (s *session) setTimeline(mediaURL string, offset int) {
+	s.timelineMu.Lock()
+	defer s.timelineMu.Unlock()
+	s.MediaURL = mediaURL
+	s.seekOffset = offset
+}
+
+func (m *Manager) seekDLNATranscoded(ctx context.Context, sess *session, resolvedSeconds int) error {
 	if sess == nil || sess.dlnaPayload == nil {
 		return errors.New("dlna session is not configured")
 	}
 
+	sess.playbackMu.Lock()
+	defer sess.playbackMu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancelSeek := context.WithCancel(ctx)
+	sess.seekCancelMu.Lock()
+	if sess.seekClosing {
+		sess.seekCancelMu.Unlock()
+		cancelSeek()
+		return errors.New("session is closing")
+	}
+	sess.seekCancel = cancelSeek
+	sess.seekCancelMu.Unlock()
+	defer func() {
+		sess.seekCancelMu.Lock()
+		sess.seekCancel = nil
+		sess.seekCancelMu.Unlock()
+		cancelSeek()
+	}()
+	if sess.closed {
+		return errors.New("session is closed")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	raw := sess.dlnaPayload.RawPayload()
 	if raw == nil {
 		return errors.New("dlna payload details are unavailable")
 	}
-	raw.FFmpegSeek = resolvedSeconds
+	if err := m.refreshDLNASeekSubtitles(ctx, sess, resolvedSeconds); err != nil {
+		return err
+	}
 
 	// Best effort: stop first to force a clean transport restart on strict renderers.
-	_ = m.withRetry(ctx, func() error {
-		return sess.dlnaPayload.SendtoTV("Stop")
+	_ = m.withRetryAwait(ctx, func() error {
+		return sess.dlnaPayload.SendtoTVContext(ctx, "Stop")
 	})
 
-	if err := m.withRetry(ctx, func() error {
-		return sess.dlnaPayload.SendtoTV("Play1")
+	if err := m.withRetryAwait(ctx, func() error {
+		return sess.dlnaPayload.SendtoTVContext(ctx, "Play1")
 	}); err != nil {
 		return err
 	}
 
-	// Best effort: some renderers still expect a follow-up Seek command.
-	_ = m.withRetry(ctx, func() error {
-		return sess.dlnaPayload.SeekSoapCall(reltime)
-	})
+	// FFmpeg has already skipped to the requested source position. The new
+	// stream starts at zero; another renderer seek would skip the offset twice.
+	sess.setTimeline(sess.streamURL(), resolvedSeconds)
 	return nil
 }
 
-func (m *Manager) beamChromecast(ctx context.Context, req domain.BeamRequest, device *domain.Device, mode string) (*domain.BeamResult, error) {
+func (m *Manager) beamChromecast(ctx context.Context, req domain.BeamRequest, device *domain.Device, mode string, torrent *torrentPlayback) (*domain.BeamResult, error) {
 	if m.castFactory == nil {
 		return nil, toolError("INTERNAL_ERROR", "Chromecast adapter is not configured")
 	}
@@ -670,35 +797,46 @@ func (m *Manager) beamChromecast(ctx context.Context, req domain.BeamRequest, de
 	if err != nil {
 		return nil, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to create Chromecast client: %v", err))
 	}
-	if err := m.withRetry(ctx, func() error {
-		return client.Connect()
+	prepareCtx, cancelPrepare := m.preparationContext(ctx, torrent)
+	playback, err := m.preparePlayback(prepareCtx, req, device, mode, torrent)
+	cancelPrepare()
+	if err != nil {
+		_ = client.ForceClose()
+		return nil, err
+	}
+	startupCtx, cancelStartup := m.operationContext(ctx)
+	defer cancelStartup()
+	if err := m.withRetry(startupCtx, func() error {
+		return client.ConnectContext(startupCtx)
 	}); err != nil {
-		_ = client.Close(true)
+		cleanupPrepared(playback)
+		_ = client.ForceClose()
 		return nil, toolError("DEVICE_UNREACHABLE", fmt.Sprintf("failed to connect to Chromecast device: %v", err))
 	}
 
-	playback, err := m.preparePlayback(ctx, req, device, mode)
-	if err != nil {
-		_ = client.Close(true)
-		return nil, err
-	}
-
 	loadResultCh := make(chan error, 1)
+	loadCtx, handoff, cancelLoad := m.chromecastLoadContext(startupCtx)
+	defer handoff()
 	startTime := 0
 	if req.StartSeconds != nil && !playback.transcoding {
 		startTime = *req.StartSeconds
 	}
 	go func() {
-		// castprotocol.Load blocks until media completes; run it asynchronously and unblock as soon as
-		// device state reports playback started.
-		loadResultCh <- client.Load(playback.mediaURL, playback.mediaType, playback.title, startTime, playback.mediaDuration, playback.subtitleURL, playback.live)
+		loadResultCh <- client.LoadMediaContext(loadCtx, castprotocol.LoadRequest{
+			MediaURL: playback.mediaURL, ContentType: playback.mediaType,
+			Metadata: metadata.Media{Title: playback.title}, StartTime: startTime,
+			Duration:    remainingDuration(playback.mediaDuration, startSeconds(req.StartSeconds), playback.transcoding),
+			SubtitleURL: playback.subtitleURL, TorrentSubtitleURL: playback.torrentSubtitleURL, Live: playback.live,
+		})
 	}()
 
-	if err := m.waitForChromecastPlaybackStart(ctx, client, loadResultCh); err != nil {
+	if err := m.waitForChromecastPlaybackStart(startupCtx, client, loadResultCh); err != nil {
+		cancelLoad()
 		cleanupPrepared(playback)
-		_ = client.Close(true)
+		_ = client.ForceClose()
 		return nil, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to start Chromecast playback: %v", err))
 	}
+	handoff()
 
 	sess := &session{
 		ID:            newSessionID(),
@@ -713,8 +851,17 @@ func (m *Manager) beamChromecast(ctx context.Context, req domain.BeamRequest, de
 		mediaDuration: playback.mediaDuration,
 		castClient:    client,
 		httpServer:    playback.httpServer,
-		sourceCloser:  playback.sourceCloser,
+		sourceCloser:  combineClosers(playback.sourceCloser, torrent),
 		castSeekPlan:  playback.castSeekPlan,
+		torrent:       torrent,
+		loadCancel:    cancelLoad,
+	}
+	if playback.transcoding {
+		sess.seekOffset = startSeconds(req.StartSeconds)
+	}
+	if err := ctx.Err(); err != nil {
+		_ = shutdownSession(sess, true)
+		return nil, err
 	}
 	m.initializeSessionLifecycle(sess, "buffering", "")
 	replaced, stored := m.storeSession(sess)
@@ -731,7 +878,15 @@ func (m *Manager) beamChromecast(ctx context.Context, req domain.BeamRequest, de
 		MediaURL:    sess.MediaURL,
 		Transcoding: sess.Transcoding,
 		Warnings:    append([]string{}, sess.Warnings...),
+		Torrent:     torrent.status(),
 	}, nil
+}
+
+func remainingDuration(duration float64, offset int, transcoding bool) float64 {
+	if !transcoding || duration <= 0 {
+		return duration
+	}
+	return math.Max(0, duration-float64(offset))
 }
 
 func (m *Manager) waitForChromecastPlaybackStart(ctx context.Context, client adapters.CastClient, loadResultCh <-chan error) error {
@@ -780,7 +935,7 @@ func (m *Manager) waitForChromecastPlaybackStart(ctx context.Context, client ada
 	}
 }
 
-func (m *Manager) beamDLNA(ctx context.Context, req domain.BeamRequest, device *domain.Device, mode string) (*domain.BeamResult, error) {
+func (m *Manager) beamDLNA(ctx context.Context, req domain.BeamRequest, device *domain.Device, mode string, torrent *torrentPlayback) (*domain.BeamResult, error) {
 	if m.dlnaFactory == nil {
 		return nil, toolError("INTERNAL_ERROR", "DLNA adapter is not configured")
 	}
@@ -800,10 +955,12 @@ func (m *Manager) beamDLNA(ctx context.Context, req domain.BeamRequest, device *
 
 	var prepared *preparedDLNA
 	var err error
+	prepareCtx, cancelPrepare := m.preparationContext(ctx, torrent)
+	defer cancelPrepare()
 	if isURL {
-		prepared, err = m.prepareDLNAURLPlayback(ctx, req, device, mode)
+		prepared, err = m.prepareDLNAURLPlayback(prepareCtx, req, device, mode)
 	} else {
-		prepared, err = m.prepareDLNAFilePlayback(ctx, req, device, mode)
+		prepared, err = m.prepareDLNAFilePlayback(prepareCtx, req, device, mode, torrent)
 	}
 	if err != nil {
 		return nil, err
@@ -821,12 +978,23 @@ func (m *Manager) beamDLNA(ctx context.Context, req domain.BeamRequest, device *
 		Transcoding:   prepared.transcoding,
 		Warnings:      append([]string{}, prepared.warnings...),
 		Protocol:      "dlna",
+		mediaDuration: prepared.mediaDuration,
 		dlnaPayload:   prepared.payload,
 		httpServer:    prepared.httpServer,
-		sourceCloser:  prepared.sourceCloser,
+		sourceCloser:  combineClosers(prepared.sourceCloser, torrent),
+		torrent:       torrent,
+		dlnaSeekPlan:  prepared.dlnaSeekPlan,
 		monitorCancel: monitorCancel,
 		monitorDone:   make(chan struct{}),
 		callbackCh:    prepared.callbackCh,
+	}
+	if prepared.transcoding {
+		sess.seekOffset = startSeconds(req.StartSeconds)
+	}
+	if err := ctx.Err(); err != nil {
+		close(sess.monitorDone)
+		_ = shutdownSession(sess, true)
+		return nil, err
 	}
 	m.initializeSessionLifecycle(sess, "buffering", "")
 
@@ -849,6 +1017,7 @@ func (m *Manager) beamDLNA(ctx context.Context, req domain.BeamRequest, device *
 		MediaURL:    sess.MediaURL,
 		Transcoding: sess.Transcoding,
 		Warnings:    append([]string{}, sess.Warnings...),
+		Torrent:     torrent.status(),
 	}, nil
 }
 
@@ -910,431 +1079,6 @@ func normalizeDeviceTarget(v string) string {
 		normalized = strings.TrimSpace(normalized[:idx])
 	}
 	return normalized
-}
-
-func (m *Manager) preparePlayback(ctx context.Context, req domain.BeamRequest, device *domain.Device, mode string) (*preparedPlayback, error) {
-	source := strings.TrimSpace(req.Source)
-	if source == "" {
-		return nil, toolError("UNSUPPORTED_MEDIA", "source is empty")
-	}
-
-	if parsed, err := url.Parse(source); err == nil && parsed.Scheme != "" {
-		return m.prepareURLPlayback(ctx, req, device, mode)
-	}
-	return m.prepareFilePlayback(req, device, mode)
-}
-
-func (m *Manager) prepareFilePlayback(req domain.BeamRequest, device *domain.Device, mode string) (*preparedPlayback, error) {
-	source, err := m.validateLocalFilePath(req.Source, "source")
-	if err != nil {
-		return nil, err
-	}
-	subtitlesPath, err := m.resolveSubtitlePathForFile(source, req.SubtitlesPath)
-	if err != nil {
-		return nil, err
-	}
-
-	mediaType := detectFileMediaType(source)
-	transcoding, warnings, ffmpegPath, err := m.computeTranscodingForFile(mode, mediaType, source)
-	if err != nil {
-		return nil, err
-	}
-
-	listenAddr, server, err := m.newStreamServer(device.Address)
-	if err != nil {
-		return nil, err
-	}
-
-	route := mediaRouteFor(source)
-	var tcOpts *utils.TranscodeOptions
-	mediaDuration := 0.0
-	var castSeekPlan *chromecastTranscodeSeek
-	startAt := startSeconds(req.StartSeconds)
-	if transcoding {
-		tcOpts = &utils.TranscodeOptions{
-			FFmpegPath:   ffmpegPath,
-			SubsPath:     validatedSubtitlePath(subtitlesPath),
-			SeekSeconds:  startAt,
-			SubtitleSize: utils.SubtitleSizeMedium,
-		}
-		mediaType = "video/mp4"
-		castSeekPlan = &chromecastTranscodeSeek{
-			sourcePath: source,
-			ffmpegPath: ffmpegPath,
-			subsPath:   validatedSubtitlePath(subtitlesPath),
-			route:      route,
-		}
-		if duration, durationErr := utils.DurationForMediaSeconds(ffmpegPath, source); durationErr == nil {
-			mediaDuration = duration
-		} else {
-			warnings = append(warnings, "failed to determine media duration for transcoded stream")
-		}
-	}
-
-	server.AddHandler(route, nil, tcOpts, source)
-
-	subtitleURL, subtitleWarnings, subtitleErr := m.addSubtitleSidecar(server, listenAddr, subtitlesPath, transcoding)
-	if subtitleErr != nil {
-		cleanupPrepared(&preparedPlayback{httpServer: server})
-		return nil, subtitleErr
-	}
-	warnings = append(warnings, subtitleWarnings...)
-
-	if err := startStreamServer(server); err != nil {
-		return nil, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to start media server: %v", err))
-	}
-
-	return &preparedPlayback{
-		mediaURL:      "http://" + listenAddr + route,
-		mediaType:     mediaType,
-		title:         mediaTitleFor(source),
-		subtitleURL:   subtitleURL,
-		live:          false,
-		transcoding:   transcoding,
-		mediaDuration: mediaDuration,
-		warnings:      warnings,
-		httpServer:    server,
-		castSeekPlan:  castSeekPlan,
-	}, nil
-}
-
-func (m *Manager) prepareURLPlayback(ctx context.Context, req domain.BeamRequest, device *domain.Device, mode string) (*preparedPlayback, error) {
-	sourceURL := strings.TrimSpace(req.Source)
-	if _, err := m.validateSourceURLPolicy(sourceURL); err != nil {
-		return nil, err
-	}
-
-	if utils.IsHLSStream(sourceURL, "") {
-		if mode == transcodeAlways {
-			return nil, toolError("TRANSCODE_REQUIRED", "transcode=always is not supported for direct HLS URL casting")
-		}
-		return &preparedPlayback{
-			mediaURL:    sourceURL,
-			mediaType:   "application/vnd.apple.mpegurl",
-			title:       mediaTitleFor(sourceURL),
-			subtitleURL: "",
-			live:        true,
-			warnings:    []string{},
-		}, nil
-	}
-
-	subtitlesPath, err := m.validateLocalFilePath(req.SubtitlesPath, "subtitles_path")
-	if err != nil {
-		return nil, err
-	}
-
-	var preparedMedia any
-	var mediaType string
-	err = m.withRetry(ctx, func() error {
-		var callErr error
-		preparedMedia, mediaType, callErr = m.prepareURLMedia(ctx, sourceURL)
-		return callErr
-	})
-	if err != nil {
-		return nil, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to stream source URL: %v", err))
-	}
-	if mediaType == "" || mediaType == "/" {
-		mediaType = "application/octet-stream"
-	}
-
-	warnings := []string{}
-	if mode != transcodeAlways {
-		if closer := asCloser(preparedMedia); closer != nil {
-			_ = closer.Close()
-		}
-		if mode == transcodeAuto && strings.Contains(mediaType, "video") {
-			warnings = append(warnings, "auto transcode for URL sources defaults to direct URL stream")
-		}
-		return m.prepareDirectURLPlayback(device, sourceURL, mediaType, subtitlesPath, warnings)
-	}
-
-	ffmpegPath := ""
-	transcoding := false
-	if mode == transcodeAlways {
-		if strings.Contains(mediaType, "video") {
-			ffmpegPath, err = m.requireFFmpeg()
-			if err != nil {
-				if closer, ok := preparedMedia.(io.Closer); ok {
-					_ = closer.Close()
-				}
-				return nil, err
-			}
-			transcoding = true
-		} else {
-			warnings = append(warnings, "transcode=always ignored for non-video URL source")
-		}
-	}
-	if !transcoding {
-		if closer := asCloser(preparedMedia); closer != nil {
-			_ = closer.Close()
-		}
-		return m.prepareDirectURLPlayback(device, sourceURL, mediaType, subtitlesPath, warnings)
-	}
-
-	listenAddr, server, err := m.newStreamServer(device.Address)
-	if err != nil {
-		if closer, ok := preparedMedia.(io.Closer); ok {
-			_ = closer.Close()
-		}
-		return nil, err
-	}
-
-	route := mediaRouteFor(sourceURL)
-	var tcOpts *utils.TranscodeOptions
-	startAt := startSeconds(req.StartSeconds)
-	if transcoding {
-		tcOpts = &utils.TranscodeOptions{
-			FFmpegPath:   ffmpegPath,
-			SubsPath:     validatedSubtitlePath(subtitlesPath),
-			SeekSeconds:  startAt,
-			SubtitleSize: utils.SubtitleSizeMedium,
-		}
-		mediaType = "video/mp4"
-	}
-
-	server.AddHandler(route, nil, tcOpts, preparedMedia)
-
-	subtitleURL, subtitleWarnings, subtitleErr := m.addSubtitleSidecar(server, listenAddr, subtitlesPath, transcoding)
-	if subtitleErr != nil {
-		cleanupPrepared(&preparedPlayback{httpServer: server, sourceCloser: asCloser(preparedMedia)})
-		return nil, subtitleErr
-	}
-	warnings = append(warnings, subtitleWarnings...)
-
-	if err := startStreamServer(server); err != nil {
-		cleanupPrepared(&preparedPlayback{httpServer: server, sourceCloser: asCloser(preparedMedia)})
-		return nil, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to start media server: %v", err))
-	}
-
-	return &preparedPlayback{
-		mediaURL:     "http://" + listenAddr + route,
-		mediaType:    mediaType,
-		title:        mediaTitleFor(sourceURL),
-		subtitleURL:  subtitleURL,
-		live:         true,
-		transcoding:  transcoding,
-		warnings:     warnings,
-		httpServer:   server,
-		sourceCloser: asCloser(preparedMedia),
-	}, nil
-}
-
-func (m *Manager) prepareDirectURLPlayback(device *domain.Device, sourceURL, mediaType, subtitlesPath string, warnings []string) (*preparedPlayback, error) {
-	playback := &preparedPlayback{
-		mediaURL:    sourceURL,
-		mediaType:   mediaType,
-		title:       mediaTitleFor(sourceURL),
-		subtitleURL: "",
-		live:        true,
-		warnings:    append([]string{}, warnings...),
-	}
-	if strings.TrimSpace(subtitlesPath) == "" {
-		return playback, nil
-	}
-
-	listenAddr, server, err := m.newStreamServer(device.Address)
-	if err != nil {
-		return nil, err
-	}
-
-	subtitleURL, subtitleWarnings, subtitleErr := m.addSubtitleSidecar(server, listenAddr, subtitlesPath, false)
-	if subtitleErr != nil {
-		cleanupPrepared(&preparedPlayback{httpServer: server})
-		return nil, subtitleErr
-	}
-	playback.warnings = append(playback.warnings, subtitleWarnings...)
-	if subtitleURL == "" {
-		cleanupPrepared(&preparedPlayback{httpServer: server})
-		return playback, nil
-	}
-
-	if err := startStreamServer(server); err != nil {
-		cleanupPrepared(&preparedPlayback{httpServer: server})
-		return nil, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to start subtitle server: %v", err))
-	}
-
-	playback.subtitleURL = subtitleURL
-	playback.httpServer = server
-	return playback, nil
-}
-
-func (m *Manager) prepareDLNAFilePlayback(ctx context.Context, req domain.BeamRequest, device *domain.Device, mode string) (*preparedDLNA, error) {
-	source, err := m.validateLocalFilePath(req.Source, "source")
-	if err != nil {
-		return nil, err
-	}
-
-	subtitlesPath, err := m.resolveSubtitlePathForFile(source, req.SubtitlesPath)
-	if err != nil {
-		return nil, err
-	}
-
-	mediaType := detectFileMediaType(source)
-	transcoding, warnings, ffmpegPath, err := m.computeTranscodingForDLNA(mode, mediaType)
-	if err != nil {
-		return nil, err
-	}
-
-	prepared, err := m.startDLNAServerAndPlay(ctx, device, source, mediaType, source, subtitlesPath, transcoding, ffmpegPath, startSeconds(req.StartSeconds), "")
-	if err != nil {
-		return nil, err
-	}
-	prepared.title = mediaTitleFor(source)
-	prepared.contentType = mediaType
-	prepared.warnings = append(prepared.warnings, warnings...)
-	return prepared, nil
-}
-
-func (m *Manager) prepareDLNAURLPlayback(ctx context.Context, req domain.BeamRequest, device *domain.Device, mode string) (*preparedDLNA, error) {
-	sourceURL := strings.TrimSpace(req.Source)
-	if _, err := m.validateSourceURLPolicy(sourceURL); err != nil {
-		return nil, err
-	}
-
-	if utils.IsHLSStream(sourceURL, "") {
-		return nil, dlnaHLSUnsupportedError()
-	}
-
-	subtitlesPath, err := m.validateDLNASubtitles(req.SubtitlesPath)
-	if err != nil {
-		return nil, err
-	}
-
-	var preparedMedia any
-	var mediaType string
-	err = m.withRetry(ctx, func() error {
-		var callErr error
-		preparedMedia, mediaType, callErr = m.prepareURLMedia(ctx, sourceURL)
-		return callErr
-	})
-	if err != nil {
-		return nil, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to stream source URL: %v", err))
-	}
-
-	if mediaType == "" || mediaType == "/" {
-		mediaType = detectURLMediaType(sourceURL)
-		if mediaType == "" {
-			mediaType = "application/octet-stream"
-		}
-	}
-
-	transcoding, tcWarnings, ffmpegPath, err := m.computeTranscodingForDLNA(mode, mediaType)
-	if err != nil {
-		if closer := asCloser(preparedMedia); closer != nil {
-			_ = closer.Close()
-		}
-		return nil, err
-	}
-
-	prepared, err := m.startDLNAServerAndPlay(ctx, device, preparedMedia, mediaType, sourceURL, subtitlesPath, transcoding, ffmpegPath, startSeconds(req.StartSeconds), "")
-	if err != nil {
-		if closer := asCloser(preparedMedia); closer != nil {
-			_ = closer.Close()
-		}
-		return nil, err
-	}
-	prepared.title = mediaTitleFor(sourceURL)
-	prepared.contentType = mediaType
-	prepared.warnings = append(prepared.warnings, tcWarnings...)
-	prepared.sourceCloser = asCloser(preparedMedia)
-	return prepared, nil
-}
-
-func (m *Manager) startDLNAServerAndPlay(
-	ctx context.Context,
-	device *domain.Device,
-	media any,
-	mediaType string,
-	mediaPath string,
-	subtitlesPath string,
-	transcoding bool,
-	ffmpegPath string,
-	startAtSeconds int,
-	overrideMediaURL string,
-) (*preparedDLNA, error) {
-	payload, err := m.newDLNAPayload(ctx, device, mediaPath, mediaType, subtitlesPath, transcoding, ffmpegPath, startAtSeconds)
-	if err != nil {
-		return nil, err
-	}
-
-	server := m.serverFactory.New(payload.ListenAddress())
-	serverStarted := make(chan error, 1)
-	callbackStateCh := make(chan string, dlnaCallbackQueueSize)
-	screen := &dlnaMonitorScreen{stateCh: callbackStateCh}
-
-	go server.StartServer(serverStarted, media, subtitlesPath, payload.RawPayload(), screen)
-	if err := <-serverStarted; err != nil {
-		return nil, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to start DLNA media server: %v", err))
-	}
-
-	if strings.TrimSpace(overrideMediaURL) != "" {
-		payload.SetMediaURL(strings.TrimSpace(overrideMediaURL))
-	}
-
-	if err := m.withRetry(ctx, func() error {
-		return payload.SendtoTV("Play1")
-	}); err != nil {
-		server.StopServer()
-		return nil, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to start DLNA playback: %v", err))
-	}
-
-	if !transcoding && startAtSeconds > 0 {
-		reltime := utils.SecondsToClockTime(startAtSeconds)
-		if err := m.withRetry(ctx, func() error {
-			return payload.SeekSoapCall(reltime)
-		}); err != nil {
-			server.StopServer()
-			return nil, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to seek DLNA playback start position: %v", err))
-		}
-	}
-
-	return &preparedDLNA{
-		mediaURL:    payload.MediaURL(),
-		transcoding: transcoding,
-		warnings:    []string{},
-		httpServer:  server,
-		payload:     payload,
-		callbackCh:  callbackStateCh,
-	}, nil
-}
-
-func (m *Manager) newDLNAPayload(
-	ctx context.Context,
-	device *domain.Device,
-	mediaPath string,
-	mediaType string,
-	subtitlesPath string,
-	transcoding bool,
-	ffmpegPath string,
-	startAtSeconds int,
-) (adapters.DLNAPayload, error) {
-	if strings.TrimSpace(mediaPath) == "" {
-		return nil, toolError("UNSUPPORTED_MEDIA", "source is empty")
-	}
-
-	subsForPayload := strings.TrimSpace(subtitlesPath)
-	if subsForPayload == "" {
-		subsForPayload = ""
-	}
-
-	payload, err := m.dlnaFactory.NewTVPayload(&soapcalls.Options{
-		Ctx:            ctx,
-		DMR:            device.Address,
-		Media:          mediaPath,
-		Subs:           subsForPayload,
-		Mtype:          mediaType,
-		Transcode:      transcoding,
-		Seek:           !transcoding,
-		FFmpegPath:     ffmpegPath,
-		FFmpegSubsPath: validatedSubtitlePath(subtitlesPath),
-		FFmpegSeek:     startAtSeconds,
-	})
-	if err != nil {
-		return nil, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to initialize DLNA payload: %v", err))
-	}
-
-	payload.SetContext(ctx)
-	return payload, nil
 }
 
 func (m *Manager) runDLNAStateMonitor(ctx context.Context, sess *session) {
@@ -1413,7 +1157,7 @@ func (s *session) recordDLNAState(state, position string, fromCallback bool, obs
 	s.recordObservationLocked(state, position, observedAt)
 }
 
-func (m *Manager) computeTranscodingForFile(mode, mediaType, source string) (bool, []string, string, error) {
+func (m *Manager) computeTranscodingForFile(ctx context.Context, mode, mediaType, source string) (bool, []string, string, error) {
 	warnings := []string{}
 	if !strings.Contains(mediaType, "video") {
 		if mode == transcodeAlways {
@@ -1439,8 +1183,11 @@ func (m *Manager) computeTranscodingForFile(mode, mediaType, source string) (boo
 		return true, warnings, ffmpegPath, nil
 	}
 
-	codecInfo, err := utils.GetMediaCodecInfo(ffmpegPath, source)
+	codecInfo, err := utils.GetMediaCodecInfoContext(ctx, ffmpegPath, source)
 	if err != nil {
+		if ctx.Err() != nil {
+			return false, nil, "", ctx.Err()
+		}
 		warnings = append(warnings, "codec probe failed; auto transcode disabled")
 		return false, warnings, ffmpegPath, nil
 	}
@@ -1504,46 +1251,30 @@ func (m *Manager) newStreamServer(deviceAddress string) (string, streamServer, e
 	return listenAddr, m.serverFactory.New(listenAddr), nil
 }
 
-func (m *Manager) addSubtitleSidecar(server streamServer, listenAddr, subtitlesPath string, transcoding bool) (string, []string, error) {
-	warnings := []string{}
-	if strings.TrimSpace(subtitlesPath) == "" {
-		return "", warnings, nil
-	}
-	if transcoding {
-		return "", warnings, nil
-	}
-
-	validatedPath, err := m.validateLocalFilePath(subtitlesPath, "subtitles_path")
-	if err != nil {
-		return "", warnings, err
-	}
-	subtitlesPath = validatedPath
-
-	route := "/subs-" + randomToken(8) + ".vtt"
-	ext := strings.ToLower(filepath.Ext(subtitlesPath))
-	switch ext {
-	case ".srt":
-		webvttData, err := utils.ConvertSRTtoWebVTT(subtitlesPath)
-		if err != nil {
-			warnings = append(warnings, "failed to convert SRT subtitles to WebVTT")
-			return "", warnings, nil
-		}
-		server.AddHandler(route, nil, nil, webvttData)
-		return "http://" + listenAddr + route, warnings, nil
-	case ".vtt":
-		server.AddHandler(route, nil, nil, subtitlesPath)
-		return "http://" + listenAddr + route, warnings, nil
-	default:
-		warnings = append(warnings, "unsupported subtitle format; expected .srt or .vtt")
-		return "", warnings, nil
-	}
-}
-
 func (m *Manager) withRetry(ctx context.Context, call func() error) error {
 	return m.withRetryRunner(ctx, call)
 }
 
 func (m *Manager) withRetryRunner(ctx context.Context, call func() error) error {
+	return m.withRetryUsing(ctx, call, runCallWithContext)
+}
+
+// withRetryAwait waits for context-aware operations to finish before returning,
+// so cancellation cannot leave control work running after releasing session locks.
+func (m *Manager) withRetryAwait(ctx context.Context, call func() error) error {
+	return m.withRetryUsing(ctx, call, func(ctx context.Context, call func() error) error {
+		if ctx != nil && ctx.Err() != nil {
+			return ctx.Err()
+		}
+		err := call()
+		if ctx != nil && ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return err
+	})
+}
+
+func (m *Manager) withRetryUsing(ctx context.Context, call func() error, run func(context.Context, func() error) error) error {
 	if call == nil {
 		return errors.New("retry call is nil")
 	}
@@ -1563,7 +1294,7 @@ func (m *Manager) withRetryRunner(ctx context.Context, call func() error) error 
 
 	var lastErr error
 	for attempt := 1; attempt <= attempts; attempt++ {
-		err := runCallWithContext(ctx, call)
+		err := run(ctx, call)
 		if err == nil {
 			return nil
 		}
@@ -1730,6 +1461,7 @@ func (m *Manager) findSessionByTarget(sessionID, targetDevice string) *session {
 }
 
 func statusResultFromSession(sess *session) *domain.StatusResult {
+	mediaURL := sess.streamURL()
 	result := &domain.StatusResult{
 		OK:          true,
 		SessionID:   sess.ID,
@@ -1739,9 +1471,10 @@ func statusResultFromSession(sess *session) *domain.StatusResult {
 		State:       "unknown",
 		Title:       strings.TrimSpace(sess.Title),
 		ContentType: strings.TrimSpace(sess.ContentType),
-		MediaURL:    strings.TrimSpace(sess.MediaURL),
+		MediaURL:    strings.TrimSpace(mediaURL),
 		Transcoding: sess.Transcoding,
 		Warnings:    append([]string{}, sess.Warnings...),
+		Torrent:     sess.torrent.status(),
 	}
 
 	if sess.mediaDuration > 0 {
@@ -1903,6 +1636,9 @@ func (m *Manager) sessionDurationSeconds(ctx context.Context, sess *session) (fl
 	if sess == nil {
 		return 0, seekDurationUnknownError()
 	}
+	if sess.Transcoding && sess.mediaDuration > 0 {
+		return sess.mediaDuration, nil
+	}
 
 	switch sess.Protocol {
 	case "chromecast":
@@ -1932,7 +1668,8 @@ func (m *Manager) sessionDurationSeconds(ctx context.Context, sess *session) (fl
 			}
 			return 0, nil
 		}
-		return statusDuration, nil
+		_, duration := sess.sourceTimeline(0, statusDuration)
+		return duration, nil
 	case "dlna":
 		if sess.dlnaPayload == nil {
 			return 0, toolError("INTERNAL_ERROR", "dlna session is not configured")
@@ -1957,7 +1694,8 @@ func (m *Manager) sessionDurationSeconds(ctx context.Context, sess *session) (fl
 		if err != nil || durationSeconds <= 0 {
 			return 0, nil
 		}
-		return float64(durationSeconds), nil
+		_, duration := sess.sourceTimeline(0, float64(durationSeconds))
+		return duration, nil
 	default:
 		return 0, unsupportedProtocolError(sess.Protocol)
 	}
@@ -1994,7 +1732,8 @@ func (m *Manager) sessionPositionSeconds(ctx context.Context, sess *session) (in
 		if duration <= 0 && sess.mediaDuration > 0 {
 			duration = sess.mediaDuration
 		}
-		return position, duration, nil
+		originalPosition, originalDuration := sess.sourceTimeline(float64(position), duration)
+		return int(math.Round(originalPosition)), originalDuration, nil
 	case "dlna":
 		if sess.dlnaPayload == nil {
 			return 0, 0, toolError("INTERNAL_ERROR", "dlna session is not configured")
@@ -2023,7 +1762,8 @@ func (m *Manager) sessionPositionSeconds(ctx context.Context, sess *session) (in
 				duration = float64(seconds)
 			}
 		}
-		return current, duration, nil
+		originalPosition, originalDuration := sess.sourceTimeline(float64(current), duration)
+		return int(math.Round(originalPosition)), originalDuration, nil
 	default:
 		return 0, 0, unsupportedProtocolError(sess.Protocol)
 	}
@@ -2259,6 +1999,9 @@ func (m *Manager) Close(ctx context.Context) error {
 	}
 
 	m.closeOnce.Do(func() {
+		if m.torrentCancel != nil {
+			defer m.torrentCancel()
+		}
 		m.mu.Lock()
 		m.closed = true
 		m.mu.Unlock()
@@ -2272,7 +2015,6 @@ func (m *Manager) Close(ctx context.Context) error {
 			case <-m.cleanupLoopDone:
 			case <-ctx.Done():
 				m.closeErr = ctx.Err()
-				return
 			}
 		}
 
@@ -2284,7 +2026,7 @@ func (m *Manager) Close(ctx context.Context) error {
 			}
 		}
 		if len(errs) > 0 {
-			m.closeErr = errors.New(strings.Join(errs, "; "))
+			m.closeErr = errors.Join(m.closeErr, errors.New(strings.Join(errs, "; ")))
 		}
 	})
 
@@ -2337,6 +2079,19 @@ func shutdownSessionWithReport(sess *session, stopMedia bool) sessionShutdownRep
 	}
 
 	sess.closeOnce.Do(func() {
+		sess.seekCancelMu.Lock()
+		sess.seekClosing = true
+		cancelSeek := sess.seekCancel
+		sess.seekCancelMu.Unlock()
+		if cancelSeek != nil {
+			cancelSeek()
+		}
+		if sess.loadCancel != nil {
+			sess.loadCancel()
+		}
+		sess.playbackMu.Lock()
+		defer sess.playbackMu.Unlock()
+		sess.closed = true
 		if sess.castClient != nil {
 			if stopMedia {
 				if err := sess.castClient.Stop(); err != nil {
@@ -2367,7 +2122,9 @@ func shutdownSessionWithReport(sess *session, stopMedia bool) sessionShutdownRep
 			sess.httpServer.StopServer()
 		}
 		if sess.sourceCloser != nil {
-			_ = sess.sourceCloser.Close()
+			if err := sess.sourceCloser.Close(); err != nil {
+				report.cleanupWarnings = append(report.cleanupWarnings, fmt.Sprintf("source close: %v", err))
+			}
 		}
 	})
 	return report
@@ -2505,17 +2262,6 @@ func asCloser(v any) io.Closer {
 	return nil
 }
 
-func validatedSubtitlePath(path string) string {
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return ""
-	}
-	if _, err := os.Stat(path); err != nil {
-		return ""
-	}
-	return path
-}
-
 func (m *Manager) resolveSubtitlePathForFile(sourcePath, requestedSubtitlesPath string) (string, error) {
 	requestedSubtitlesPath = strings.TrimSpace(requestedSubtitlesPath)
 	if requestedSubtitlesPath != "" {
@@ -2523,7 +2269,7 @@ func (m *Manager) resolveSubtitlePathForFile(sourcePath, requestedSubtitlesPath 
 	}
 
 	base := strings.TrimSuffix(sourcePath, filepath.Ext(sourcePath))
-	candidates := []string{base + ".srt", base + ".vtt"}
+	candidates := []string{base + ".srt", base + ".vtt", base + ".ass", base + ".ssa"}
 	for _, candidate := range candidates {
 		validatedPath, err := m.validateLocalFilePath(candidate, "subtitles_path")
 		if err == nil && validatedPath != "" {
