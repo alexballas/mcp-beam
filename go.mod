@@ -1,8 +1,8 @@
 module go2tv.app/mcp-beam
 
-go 1.26.0
+go 1.26.9
 
-require go2tv.app/go2tv/v2 v2.7.1-0.20261010102420-b7671d87812a
+require go2tv.app/go2tv/v2 v2.7.1-0.20261010174114-36dc47ccb208
 
 require (
 	github.com/RoaringBitmap/roaring/v2 v2.29.0 // indirect
@@ -95,7 +95,7 @@ require (
 	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/exp v0.0.0-20260908205506-85c1c2202aba // indirect
 	golang.org/x/image v0.46.0 // indirect
-	golang.org/x/net v0.59.0 // indirect
+	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/sync v0.23.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/text v0.42.0 // indirect

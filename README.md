@@ -3,7 +3,7 @@
 ![mcp-beam app icon](./assets/mcp-beam.png)
 
 ![CI](https://github.com/alexballas/mcp-beam/actions/workflows/ci.yml/badge.svg)
-![Go 1.26+](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go)
+![Go 1.26.9+](https://img.shields.io/badge/Go-1.26.9%2B-00ADD8?logo=go)
 
 ## Demo
 
@@ -85,7 +85,7 @@ Generic JSON configuration (for MCP hosts using `mcpServers`):
 ```
 
 Notes:
-- Requires `go` in `PATH` (Go `1.26+`).
+- Requires `go` in `PATH` (Go `1.26.9+`).
 - The first run may be slower due to module download/build.
 
 ### 2) Verify the server binary/module wiring
@@ -282,7 +282,7 @@ MCP config for a local binary:
 
 ## Runtime Dependencies
 
-- `go` (Go 1.26+) is required when using `go run`, building locally, or packaging releases. See [Go Installation](#go-installation) below.
+- `go` (Go 1.26.9+) is required when using `go run`, building locally, or packaging releases. See [Go Installation](#go-installation) below.
 - Downloaded release binaries do not require a local Go installation.
 - `ffmpeg` and `ffprobe` are optional for non-transcoding paths, but recommended.
   - If transcoding is required and `ffmpeg` is unavailable, calls return `FFMPEG_NOT_FOUND`.
@@ -316,7 +316,7 @@ Download and install from https://go.dev/dl/
 go version
 ```
 
-Should output: `go1.26.0` or higher.
+Should output: `go1.26.9` or higher.
 
 Install examples:
 - Linux: package manager (for example `sudo apt install ffmpeg`)
@@ -821,9 +821,9 @@ Startup issues:
 
 ## Development
 
-This development snapshot requires Go2TV's public `torrentstream`, `mediasource`, and `castsubtitles` packages, plus its synchronized DLNA control and stream APIs. These changes currently exist in the updated Go2TV checkout and are pending publication. The Go2TV revision presently pinned in `go.mod` (`b7671d87812a`) does not include them, so a build using only the published dependency cannot build this snapshot.
+The Go2TV revision pinned in `go.mod` includes the public `torrentstream`, `mediasource`, and `castsubtitles` packages and synchronized DLNA control and stream APIs. Builds use the published dependency without a local Go2TV checkout. The minimum Go version is 1.26.9, matching the upstream module.
 
-Develop with an updated Go2TV checkout containing these changes through a separate Go workspace. Point `GOWORK` at that workspace when building, and keep temporary checkout paths out of `go.mod`. Before releasing, publish the Go2TV integration changes and pin `go.mod` and `go.sum` to that revision. The module baseline remains Go 1.26; an external development checkout can select a newer toolchain.
+To develop against a local Go2TV checkout, use a separate Go workspace and point `GOWORK` at it when building. Keep temporary checkout paths out of `go.mod`.
 
 Common commands:
 
