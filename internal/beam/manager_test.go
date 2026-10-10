@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -115,6 +116,7 @@ type fakeCastClient struct {
 	loadTitle           string
 	loadLive            bool
 	loadSubtitle        string
+	loadTorrentSubtitle string
 	loadStartTime       int
 	seekSeconds         int
 	connectCalls        int
@@ -131,8 +133,21 @@ type fakeCastClient struct {
 }
 
 func (f *fakeCastClient) Connect() error {
+	return f.ConnectContext(context.Background())
+}
+
+func (f *fakeCastClient) ConnectContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if f.connectDelay > 0 {
-		time.Sleep(f.connectDelay)
+		timer := time.NewTimer(f.connectDelay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+		}
 	}
 	f.connectCalls++
 	if len(f.connectErrs) > 0 {
@@ -148,11 +163,28 @@ func (f *fakeCastClient) Connect() error {
 }
 
 func (f *fakeCastClient) Load(mediaURL, contentType, title string, startTime int, duration float64, subtitleURL string, live bool) error {
+	return f.loadContext(context.Background(), mediaURL, contentType, title, startTime, duration, subtitleURL, live)
+}
+
+func (f *fakeCastClient) loadContext(ctx context.Context, mediaURL, contentType, title string, startTime int, duration float64, subtitleURL string, live bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if f.loadDelay > 0 {
-		time.Sleep(f.loadDelay)
+		timer := time.NewTimer(f.loadDelay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+		}
 	}
 	if f.loadBlock != nil {
-		<-f.loadBlock
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-f.loadBlock:
+		}
 	}
 	f.loadCalls++
 	f.loadURL = mediaURL
@@ -187,6 +219,24 @@ func (f *fakeCastClient) LoadOnExisting(mediaURL, contentType, title string, sta
 	f.loadLive = live
 	f.loadSubtitle = subtitleURL
 	return f.loadOnExistingErr
+}
+
+func (f *fakeCastClient) LoadMediaContext(ctx context.Context, req castprotocol.LoadRequest) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.loadTorrentSubtitle = req.TorrentSubtitleURL
+	return f.loadContext(ctx, req.MediaURL, req.ContentType, req.Metadata.Title, req.StartTime, req.Duration, req.SubtitleURL, req.Live)
+}
+
+func (f *fakeCastClient) LoadMediaOnExisting(req castprotocol.LoadRequest) error {
+	f.loadTorrentSubtitle = req.TorrentSubtitleURL
+	f.loadStartTime = req.StartTime
+	return f.LoadOnExisting(req.MediaURL, req.ContentType, req.Metadata.Title, req.StartTime, req.Duration, req.SubtitleURL, req.Live)
+}
+
+func (f *fakeCastClient) ForceClose() error {
+	return f.Close(false)
 }
 
 func (f *fakeCastClient) Stop() error {
@@ -301,8 +351,14 @@ type fakeDLNAPayload struct {
 
 func (f *fakeDLNAPayload) SendtoTV(action string) error {
 	f.mu.Lock()
-	f.actions = append(f.actions, action)
 	ctx := f.ctx
+	f.mu.Unlock()
+	return f.SendtoTVContext(ctx, action)
+}
+
+func (f *fakeDLNAPayload) SendtoTVContext(ctx context.Context, action string) error {
+	f.mu.Lock()
+	f.actions = append(f.actions, action)
 	block := f.blockPlayUntilContextDone && action == "Play1"
 	actionErr := f.actionErr
 	f.mu.Unlock()
@@ -431,6 +487,7 @@ type fakeServer struct {
 	addPaths          []string
 	lastTranscodeOpts *utils.TranscodeOptions
 	lastMedia         any
+	lastSubtitles     any
 	startCalled       bool
 	startServerCalled bool
 	stopCalled        bool
@@ -444,6 +501,13 @@ func (f *fakeServer) AddHandler(path string, payload *soapcalls.TVPayload, trans
 	f.lastMedia = media
 }
 
+func (f *fakeServer) SetDLNATranscodeSeek(payload *soapcalls.TVPayload, seconds int, subsPath string, embedded *utils.EmbeddedSubtitle, subtitleRoute string, subtitles any) {
+	payload.SetTranscodeSeek(seconds, subsPath, embedded)
+	if subtitleRoute != "" {
+		f.AddHandler(subtitleRoute, nil, nil, subtitles)
+	}
+}
+
 func (f *fakeServer) StartServing(serverStarted chan<- error) {
 	f.startCalled = true
 	serverStarted <- nil
@@ -452,6 +516,7 @@ func (f *fakeServer) StartServing(serverStarted chan<- error) {
 func (f *fakeServer) StartServer(serverStarted chan<- error, media, subtitles any, tvpayload *soapcalls.TVPayload, screen httphandlers.Screen) {
 	f.startServerCalled = true
 	f.lastMedia = media
+	f.lastSubtitles = subtitles
 	f.lastScreen = screen
 	serverStarted <- nil
 }
@@ -773,7 +838,8 @@ func TestBeamMediaAutoDetectSidecarSubtitlesDLNA(t *testing.T) {
 		Protocol: "dlna",
 	}}}, nil, dlnaFactory)
 	defer manager.Close(context.Background())
-	manager.serverFactory = &fakeServerFactory{}
+	serverFactory := &fakeServerFactory{}
+	manager.serverFactory = serverFactory
 
 	result, err := manager.BeamMedia(context.Background(), domain.BeamRequest{
 		Source:       mediaPath,
@@ -789,8 +855,11 @@ func TestBeamMediaAutoDetectSidecarSubtitlesDLNA(t *testing.T) {
 	if dlnaFactory.lastOptions == nil {
 		t.Fatal("expected DLNA payload options to be captured")
 	}
-	if dlnaFactory.lastOptions.Subs != subtitlesPath {
-		t.Fatalf("expected auto-detected subtitles path %q, got %q", subtitlesPath, dlnaFactory.lastOptions.Subs)
+	if len(serverFactory.servers) != 1 {
+		t.Fatalf("expected one subtitle/media server, got %d", len(serverFactory.servers))
+	}
+	if data, ok := serverFactory.servers[0].lastSubtitles.([]byte); !ok || !strings.Contains(string(data), "00:00:00,000 --> 00:00:01,000") || !strings.Contains(string(data), "Hello") {
+		t.Fatalf("expected detected WebVTT converted to SRT, got %#v", serverFactory.servers[0].lastSubtitles)
 	}
 }
 
@@ -1154,6 +1223,10 @@ func TestGetBeamingStatusDLNAUsesTransportAndPositionInfo(t *testing.T) {
 func TestSeekBeamingChromecastTranscodedBySessionID(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
 	defer manager.Close(context.Background())
+	subtitlesPath := filepath.Join(t.TempDir(), "subs.srt")
+	if err := os.WriteFile(subtitlesPath, []byte("1\n00:01:40,000 --> 00:01:42,000\nHello\n"), 0o600); err != nil {
+		t.Fatalf("write subtitles: %v", err)
+	}
 
 	castClient := &fakeCastClient{}
 	server := &fakeServer{addr: "127.0.0.1:3551"}
@@ -1170,7 +1243,7 @@ func TestSeekBeamingChromecastTranscodedBySessionID(t *testing.T) {
 		castSeekPlan: &chromecastTranscodeSeek{
 			sourcePath: "/tmp/video.mp4",
 			ffmpegPath: "/usr/bin/ffmpeg",
-			subsPath:   "/tmp/subs.srt",
+			subsPath:   subtitlesPath,
 			route:      "/media-new.mp4",
 		},
 	}
@@ -1288,8 +1361,8 @@ func TestSeekBeamingDLNATranscodedByTargetDevice(t *testing.T) {
 	if dlnaPayload.RawPayload().FFmpegSeek != 90 {
 		t.Fatalf("expected FFmpegSeek=90, got %d", dlnaPayload.RawPayload().FFmpegSeek)
 	}
-	if dlnaPayload.seekRelTime != "00:01:30" {
-		t.Fatalf("expected follow-up reltime 00:01:30, got %s", dlnaPayload.seekRelTime)
+	if dlnaPayload.seekRelTime != "" {
+		t.Fatalf("transcoded restart must not seek the renderer a second time, got %s", dlnaPayload.seekRelTime)
 	}
 }
 
@@ -1842,8 +1915,8 @@ func TestBeamMediaChromecastURLDirectMP4HostsOnlySubtitles(t *testing.T) {
 	if serverFactory.servers[0].addCount != 1 {
 		t.Fatalf("expected only subtitles handler, got %d handlers", serverFactory.servers[0].addCount)
 	}
-	if serverFactory.servers[0].lastMedia != subtitlesPath {
-		t.Fatalf("expected subtitle handler media %q, got %#v", subtitlesPath, serverFactory.servers[0].lastMedia)
+	if data, ok := serverFactory.servers[0].lastMedia.([]byte); !ok || !strings.HasPrefix(string(data), "WEBVTT") || !strings.Contains(string(data), "caption") {
+		t.Fatalf("expected prepared WebVTT subtitle bytes, got %#v", serverFactory.servers[0].lastMedia)
 	}
 }
 
@@ -2612,8 +2685,8 @@ func TestBeamMediaDLNAURLUsesLocalProxy(t *testing.T) {
 	if len(serverFactory.servers) != 1 || !serverFactory.servers[0].startServerCalled {
 		t.Fatal("expected DLNA local proxy server to start")
 	}
-	if serverFactory.servers[0].lastMedia != preparedStream {
-		t.Fatalf("expected prepared URL stream to be served, got %#v", serverFactory.servers[0].lastMedia)
+	if _, ok := serverFactory.servers[0].lastMedia.(http.Handler); !ok {
+		t.Fatalf("expected reusable URL proxy handler, got %T", serverFactory.servers[0].lastMedia)
 	}
 	if result.MediaURL != "http://127.0.0.1:3520/media-token.mp4" {
 		t.Fatalf("expected local proxy media URL, got %s", result.MediaURL)

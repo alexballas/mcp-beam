@@ -1,20 +1,48 @@
 package domain
 
 type BeamRequest struct {
-	Source        string `json:"source"`
-	TargetDevice  string `json:"target_device"`
-	Transcode     string `json:"transcode,omitempty"`
-	SubtitlesPath string `json:"subtitles_path,omitempty"`
-	StartSeconds  *int   `json:"start_seconds,omitempty"`
+	Source                string `json:"source"`
+	TargetDevice          string `json:"target_device"`
+	Transcode             string `json:"transcode,omitempty"`
+	SubtitlesPath         string `json:"subtitles_path,omitempty"`
+	StartSeconds          *int   `json:"start_seconds,omitempty"`
+	TorrentFileIndex      *int   `json:"torrent_file_index,omitempty"`
+	SubtitleMode          string `json:"subtitle_mode,omitempty"`
+	EmbeddedSubtitleTrack *int   `json:"embedded_subtitle_track,omitempty"`
 }
 
 type BeamResult struct {
-	OK          bool     `json:"ok"`
-	SessionID   string   `json:"session_id"`
-	DeviceID    string   `json:"device_id"`
-	MediaURL    string   `json:"media_url"`
-	Transcoding bool     `json:"transcoding"`
-	Warnings    []string `json:"warnings"`
+	OK          bool           `json:"ok"`
+	SessionID   string         `json:"session_id"`
+	DeviceID    string         `json:"device_id"`
+	MediaURL    string         `json:"media_url"`
+	Transcoding bool           `json:"transcoding"`
+	Warnings    []string       `json:"warnings"`
+	Torrent     *TorrentStatus `json:"torrent,omitempty"`
+}
+
+type InspectTorrentRequest struct {
+	Source    string `json:"source"`
+	TimeoutMS int    `json:"timeout_ms,omitempty"`
+}
+
+type TorrentFile struct {
+	Index int    `json:"index"`
+	Name  string `json:"name"`
+	Size  int64  `json:"size_bytes"`
+}
+
+type InspectTorrentResult struct {
+	OK    bool          `json:"ok"`
+	Files []TorrentFile `json:"files"`
+}
+
+type TorrentStatus struct {
+	FileIndex       int     `json:"file_index"`
+	FileName        string  `json:"file_name"`
+	DownloadedBytes int64   `json:"downloaded_bytes"`
+	TotalBytes      int64   `json:"total_bytes"`
+	ProgressPercent float64 `json:"progress_percent"`
 }
 
 type StopRequest struct {
@@ -66,19 +94,20 @@ type StatusRequest struct {
 }
 
 type StatusResult struct {
-	OK              bool     `json:"ok"`
-	SessionID       string   `json:"session_id"`
-	DeviceID        string   `json:"device_id"`
-	DeviceName      string   `json:"device_name,omitempty"`
-	Protocol        string   `json:"protocol"`
-	State           string   `json:"state"`
-	PositionSeconds *float64 `json:"position_seconds,omitempty"`
-	DurationSeconds *float64 `json:"duration_seconds,omitempty"`
-	Title           string   `json:"title,omitempty"`
-	ContentType     string   `json:"content_type,omitempty"`
-	MediaURL        string   `json:"media_url,omitempty"`
-	Transcoding     bool     `json:"transcoding"`
-	Warnings        []string `json:"warnings,omitempty"`
+	OK              bool           `json:"ok"`
+	SessionID       string         `json:"session_id"`
+	DeviceID        string         `json:"device_id"`
+	DeviceName      string         `json:"device_name,omitempty"`
+	Protocol        string         `json:"protocol"`
+	State           string         `json:"state"`
+	PositionSeconds *float64       `json:"position_seconds,omitempty"`
+	DurationSeconds *float64       `json:"duration_seconds,omitempty"`
+	Title           string         `json:"title,omitempty"`
+	ContentType     string         `json:"content_type,omitempty"`
+	MediaURL        string         `json:"media_url,omitempty"`
+	Transcoding     bool           `json:"transcoding"`
+	Warnings        []string       `json:"warnings,omitempty"`
+	Torrent         *TorrentStatus `json:"torrent,omitempty"`
 }
 
 type ToolError struct {

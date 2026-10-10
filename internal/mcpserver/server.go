@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,10 +18,14 @@ import (
 	"go2tv.app/mcp-beam/internal/domain"
 )
 
-const protocolVersion = "2024-11-05"
+const serverInstructions = "Use tools/list to inspect available tools."
+
 const (
 	defaultDiscoveryTimeoutMS = 5000
 	minDiscoveryTimeoutMS     = 100
+	defaultTorrentTimeoutMS   = 60000
+	minTorrentTimeoutMS       = 1000
+	maxTorrentTimeoutMS       = 120000
 	transcodeAuto             = "auto"
 	transcodeAlways           = "always"
 	transcodeNever            = "never"
@@ -38,6 +43,7 @@ type LocalHardwareLister interface {
 }
 
 type BeamController interface {
+	InspectTorrent(ctx context.Context, req domain.InspectTorrentRequest) (*domain.InspectTorrentResult, error)
 	BeamMedia(ctx context.Context, req domain.BeamRequest) (*domain.BeamResult, error)
 	StopBeaming(ctx context.Context, req domain.StopRequest) (*domain.StopResult, error)
 	PlayBeaming(ctx context.Context, req domain.PlaybackControlRequest) (*domain.PlaybackControlResult, error)
@@ -59,6 +65,29 @@ type Server struct {
 	beamController      BeamController
 	sendMu              sync.Mutex
 	inflightTools       sync.WaitGroup
+	inflightMu          sync.Mutex
+	inflightCalls       map[string]*inflightToolCall
+
+	// resultMeta is the server identity stamped into each modern result. Name
+	// and version are immutable after New, so it is built once.
+	resultMeta map[string]any
+}
+
+// requestHandler retains one request's era until its response is sent, even
+// when other requests arrive while its tool call is running.
+type requestHandler struct {
+	*Server
+	modern bool
+	call   *inflightToolCall
+}
+
+// inflightToolCall is owned by one tools/call goroutine. Registry operations,
+// cancellation and the transition to sending a response share inflightMu.
+type inflightToolCall struct {
+	ctx        context.Context
+	cancel     context.CancelFunc
+	cancelled  bool
+	responding bool
 }
 
 type Config struct {
@@ -86,10 +115,20 @@ func New(in io.Reader, out io.Writer, cfg Config) *Server {
 		tools:               staticTools(),
 		localHardwareLister: cfg.LocalHardwareLister,
 		beamController:      cfg.BeamController,
+		inflightCalls:       make(map[string]*inflightToolCall),
+		resultMeta: map[string]any{
+			metaServerInfo: map[string]string{
+				"name":    cfg.ServerName,
+				"version": cfg.ServerVersion,
+			},
+		},
 	}
 }
 
 func (s *Server) Run(ctx context.Context) error {
+	// EOF first grants the established response-drain grace period below.
+	// Every exit then cancels work that has not finished during that grace.
+	defer s.cancelInflightCalls()
 	for {
 		select {
 		case <-ctx.Done():
@@ -143,6 +182,9 @@ func (s *Server) handle(ctx context.Context, payload []byte) error {
 	}
 
 	if len(req.ID) == 0 {
+		if (req.JSONRPC == "" || req.JSONRPC == "2.0") && req.Method == "notifications/cancelled" {
+			s.handleCancellation(req.Params)
+		}
 		return nil
 	}
 
@@ -158,39 +200,90 @@ func (s *Server) handle(ctx context.Context, payload []byte) error {
 		})
 	}
 
+	meta, err := decodeRequestMeta(req.Params)
+	if err != nil {
+		s.logCall(req.Method, "", "", startedAt, "-32602")
+		return s.send(response{
+			JSONRPC: "2.0",
+			ID:      req.ID,
+			Error: &responseError{
+				Code:    -32602,
+				Message: "invalid params",
+			},
+		})
+	}
+
+	// Era selection. An `initialize` request always selects legacy semantics,
+	// even if it carries modern `_meta`. `server/discover` exists only in the
+	// modern revision, so it is always validated. Everything else is validated
+	// only once the client has identified itself as modern -- a legacy client
+	// omits `_meta` entirely and must keep working unchanged.
+	if req.Method != "initialize" && (meta.isModern() || req.Method == "server/discover") {
+		if errResp := validateRequestMeta(meta); errResp != nil {
+			s.logCall(req.Method, "", "", startedAt, strconv.Itoa(errResp.Code))
+			return s.send(response{JSONRPC: "2.0", ID: req.ID, Error: errResp})
+		}
+	}
+
+	// Having survived validation, the request is modern only if it carried
+	// modern `_meta`, or is the modern-only `server/discover`. An `initialize`
+	// handshake selects legacy semantics however it is dressed, and a request
+	// that identified itself as neither is served the legacy shape: it cannot
+	// be a valid modern request, which must always carry `_meta`.
+	handler := requestHandler{
+		Server: s,
+		modern: req.Method == "server/discover" || (req.Method != "initialize" && meta.isModern()),
+	}
+
 	switch req.Method {
 	case "initialize":
 		s.logCall("initialize", "", "", startedAt, "")
-		return s.send(response{JSONRPC: "2.0", ID: req.ID, Result: initializeResult{
-			ProtocolVersion: protocolVersion,
-			Capabilities: map[string]any{
-				"tools": map[string]any{
-					"listChanged": false,
-				},
-			},
+		return handler.send(response{JSONRPC: "2.0", ID: req.ID, Result: initializeResult{
+			ProtocolVersion: protocolVersionLegacy,
+			Capabilities:    serverCapabilities(),
 			ServerInfo: map[string]string{
 				"name":    s.serverName,
 				"version": s.serverVersion,
 			},
-			Instructions: "Use tools/list to inspect available tools.",
+			Instructions: serverInstructions,
+		}})
+	case "server/discover":
+		s.logCall("server/discover", "", "", startedAt, "")
+		return handler.send(response{JSONRPC: "2.0", ID: req.ID, Result: discoverResult{
+			SupportedVersions: supportedProtocolVersions,
+			Capabilities:      serverCapabilities(),
+			Instructions:      serverInstructions,
 		}})
 	case "tools/list":
 		s.logCall("tools/list", "", "", startedAt, "")
-		return s.send(response{JSONRPC: "2.0", ID: req.ID, Result: toolsListResult{Tools: s.tools}})
+		return handler.send(response{JSONRPC: "2.0", ID: req.ID, Result: toolsListResult{Tools: s.tools}})
 	case "tools/call":
 		toolID := append(json.RawMessage(nil), req.ID...)
 		toolParams := append(json.RawMessage(nil), req.Params...)
+		key, call, err := s.registerToolCall(ctx, toolID)
+		if err != nil {
+			s.logCall("tools/call", "", "", startedAt, "-32600")
+			return handler.send(response{
+				JSONRPC: "2.0", ID: req.ID,
+				Error: &responseError{Code: -32600, Message: err.Error()},
+			})
+		}
+		handler.call = call
 		s.inflightTools.Add(1)
 		go func(callID, rawParams json.RawMessage) {
 			defer s.inflightTools.Done()
-			if err := s.handleToolCall(ctx, callID, rawParams); err != nil {
+			defer s.finishToolCall(key, call)
+			if call.ctx.Err() != nil {
+				return
+			}
+			if err := handler.handleToolCall(call.ctx, callID, rawParams); err != nil {
 				s.logLifecycle(slog.LevelError, "mcp_tool_call_error", slog.String("error", err.Error()))
 			}
 		}(toolID, toolParams)
 		return nil
 	default:
 		s.logCall(req.Method, "", "", startedAt, "-32601")
-		return s.send(response{
+		return handler.send(response{
 			JSONRPC: "2.0",
 			ID:      req.ID,
 			Error: &responseError{
@@ -201,7 +294,109 @@ func (s *Server) handle(ctx context.Context, payload []byte) error {
 	}
 }
 
-func (s *Server) handleToolCall(ctx context.Context, id json.RawMessage, rawParams json.RawMessage) error {
+// requestIDKey preserves the distinction between string and integer IDs and
+// normalizes string escapes, so a cancellation matches the original ID even
+// when its JSON string was encoded differently. MCP IDs are strings or integers.
+func requestIDKey(raw json.RawMessage) (string, bool) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return "", false
+	}
+	if raw[0] == '"' {
+		var id string
+		if err := json.Unmarshal(raw, &id); err != nil {
+			return "", false
+		}
+		return "string:" + id, true
+	}
+	digits := raw
+	if digits[0] == '-' {
+		digits = digits[1:]
+	}
+	if len(digits) == 0 || (len(digits) > 1 && digits[0] == '0') {
+		return "", false
+	}
+	for _, digit := range digits {
+		if digit < '0' || digit > '9' {
+			return "", false
+		}
+	}
+	if bytes.Equal(digits, []byte("0")) {
+		return "integer:0", true
+	}
+	return "integer:" + string(raw), true
+}
+
+func (s *Server) registerToolCall(ctx context.Context, id json.RawMessage) (string, *inflightToolCall, error) {
+	key, ok := requestIDKey(id)
+	if !ok {
+		return "", nil, fmt.Errorf("invalid request ID")
+	}
+	s.inflightMu.Lock()
+	defer s.inflightMu.Unlock()
+	if _, exists := s.inflightCalls[key]; exists {
+		return "", nil, fmt.Errorf("request ID is already in flight")
+	}
+	callCtx, cancel := context.WithCancel(ctx)
+	call := &inflightToolCall{ctx: callCtx, cancel: cancel}
+	if s.inflightCalls == nil {
+		s.inflightCalls = make(map[string]*inflightToolCall)
+	}
+	s.inflightCalls[key] = call
+	return key, call, nil
+}
+
+func (s *Server) finishToolCall(key string, call *inflightToolCall) {
+	s.inflightMu.Lock()
+	if s.inflightCalls[key] == call {
+		delete(s.inflightCalls, key)
+	}
+	s.inflightMu.Unlock()
+	call.cancel()
+}
+
+func (s *Server) handleCancellation(rawParams json.RawMessage) {
+	var params struct {
+		RequestID json.RawMessage `json:"requestId"`
+		Reason    *string         `json:"reason,omitempty"`
+		Meta      json.RawMessage `json:"_meta,omitempty"`
+	}
+	if err := decodeStrict(rawParams, &params); err != nil {
+		return
+	}
+	key, ok := requestIDKey(params.RequestID)
+	if !ok {
+		return
+	}
+	s.inflightMu.Lock()
+	call := s.inflightCalls[key]
+	if call == nil || call.responding || call.cancelled {
+		s.inflightMu.Unlock()
+		return
+	}
+	call.cancelled = true
+	// Cancel while holding the registry lock so a concurrent completion cannot
+	// expose this ID for reuse before this particular call has been cancelled.
+	call.cancel()
+	s.inflightMu.Unlock()
+	reason := ""
+	if params.Reason != nil {
+		reason = *params.Reason
+	}
+	s.logLifecycle(slog.LevelInfo, "mcp_request_cancelled", slog.String("request_id", key), slog.String("reason", reason))
+}
+
+func (s *Server) cancelInflightCalls() {
+	s.inflightMu.Lock()
+	defer s.inflightMu.Unlock()
+	for _, call := range s.inflightCalls {
+		call.cancelled = true
+		call.cancel()
+	}
+	clear(s.inflightCalls)
+}
+
+func (s requestHandler) handleToolCall(ctx context.Context, id json.RawMessage, rawParams json.RawMessage) error {
 	startedAt := time.Now()
 
 	params, err := decodeToolCallParams(rawParams)
@@ -214,6 +409,8 @@ func (s *Server) handleToolCall(ctx context.Context, id json.RawMessage, rawPara
 		return s.handleListLocalHardwareCall(ctx, id, params.Arguments)
 	case "beam_media":
 		return s.handleBeamMediaCall(ctx, id, params.Arguments)
+	case "inspect_torrent":
+		return s.handleInspectTorrentCall(ctx, id, params.Arguments)
 	case "stop_beaming":
 		return s.handleStopBeamingCall(ctx, id, params.Arguments)
 	case "play_beaming":
@@ -234,6 +431,21 @@ func (s *Server) handleToolCall(ctx context.Context, id json.RawMessage, rawPara
 				fmt.Sprintf("unknown tool: %s", params.Name),
 			),
 		})
+	}
+}
+
+// isProtocolCallParam reports whether a top-level `tools/call` param belongs to
+// the protocol rather than to the tool's arguments. Clients that omit
+// `arguments` fall through to the flattening path below, which must not fold
+// these into the argument object: strict decoding would then reject the call as
+// carrying unknown fields. `inputResponses` and `requestState` arrive on multi
+// round-trip retries, which this server never asks for but may still receive.
+func isProtocolCallParam(key string) bool {
+	switch key {
+	case "name", "_meta", "inputResponses", "requestState":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -261,7 +473,7 @@ func decodeToolCallParams(raw json.RawMessage) (toolsCallParams, error) {
 	if !ok {
 		flattened := map[string]json.RawMessage{}
 		for key, value := range payload {
-			if key == "name" || key == "_meta" {
+			if isProtocolCallParam(key) {
 				continue
 			}
 			flattened[key] = value
@@ -285,7 +497,46 @@ func decodeToolCallParams(raw json.RawMessage) (toolsCallParams, error) {
 	}, nil
 }
 
-func (s *Server) handleBeamMediaCall(ctx context.Context, id json.RawMessage, rawArgs json.RawMessage) error {
+func (s requestHandler) handleInspectTorrentCall(ctx context.Context, id json.RawMessage, rawArgs json.RawMessage) error {
+	startedAt := time.Now()
+	if s.beamController == nil {
+		return s.sendToolInternalError("inspect_torrent", "", "", startedAt, id, "beam controller is not configured")
+	}
+	var args struct {
+		Source    string `json:"source"`
+		TimeoutMS *int   `json:"timeout_ms,omitempty"`
+	}
+	if err := decodeStrict(rawArgs, &args); err != nil {
+		return s.sendInvalidParams("inspect_torrent", "", "", startedAt, id)
+	}
+	args.Source = strings.TrimSpace(args.Source)
+	timeoutMS := defaultTorrentTimeoutMS
+	if args.TimeoutMS != nil {
+		timeoutMS = *args.TimeoutMS
+	}
+	if args.Source == "" || timeoutMS < minTorrentTimeoutMS || timeoutMS > maxTorrentTimeoutMS {
+		return s.sendInvalidParams("inspect_torrent", "", "", startedAt, id)
+	}
+	result, err := s.beamController.InspectTorrent(ctx, domain.InspectTorrentRequest{
+		Source:    args.Source,
+		TimeoutMS: timeoutMS,
+	})
+	if err != nil {
+		s.logCall("inspect_torrent", "", "", startedAt, toolErrorCode(err))
+		return s.send(response{JSONRPC: "2.0", ID: id, Result: toolErrorResultFromError(err)})
+	}
+	s.logCall("inspect_torrent", "", "", startedAt, "")
+	return s.send(response{
+		JSONRPC: "2.0",
+		ID:      id,
+		Result: toolCallResult{
+			Content:           []toolContent{{Type: "text", Text: formatTorrentFiles(result.Files)}},
+			StructuredContent: result,
+		},
+	})
+}
+
+func (s requestHandler) handleBeamMediaCall(ctx context.Context, id json.RawMessage, rawArgs json.RawMessage) error {
 	startedAt := time.Now()
 
 	if s.beamController == nil {
@@ -293,11 +544,14 @@ func (s *Server) handleBeamMediaCall(ctx context.Context, id json.RawMessage, ra
 	}
 
 	var args struct {
-		Source        string  `json:"source"`
-		TargetDevice  string  `json:"target_device"`
-		Transcode     *string `json:"transcode,omitempty"`
-		SubtitlesPath *string `json:"subtitles_path,omitempty"`
-		StartSeconds  *int    `json:"start_seconds,omitempty"`
+		Source                string  `json:"source"`
+		TargetDevice          string  `json:"target_device"`
+		Transcode             *string `json:"transcode,omitempty"`
+		SubtitlesPath         *string `json:"subtitles_path,omitempty"`
+		StartSeconds          *int    `json:"start_seconds,omitempty"`
+		TorrentFileIndex      *int    `json:"torrent_file_index,omitempty"`
+		SubtitleMode          *string `json:"subtitle_mode,omitempty"`
+		EmbeddedSubtitleTrack *int    `json:"embedded_subtitle_track,omitempty"`
 	}
 	if err := decodeStrict(rawArgs, &args); err != nil {
 		return s.sendInvalidParams("beam_media", "", "", startedAt, id)
@@ -324,13 +578,29 @@ func (s *Server) handleBeamMediaCall(ctx context.Context, id json.RawMessage, ra
 	if args.StartSeconds != nil && *args.StartSeconds < 0 {
 		return s.sendInvalidParams("beam_media", args.TargetDevice, "", startedAt, id)
 	}
+	if (args.TorrentFileIndex != nil && *args.TorrentFileIndex < 0) ||
+		(args.EmbeddedSubtitleTrack != nil && *args.EmbeddedSubtitleTrack < 0) {
+		return s.sendInvalidParams("beam_media", args.TargetDevice, "", startedAt, id)
+	}
+	subtitleMode := "auto"
+	if args.SubtitleMode != nil {
+		subtitleMode = strings.ToLower(strings.TrimSpace(*args.SubtitleMode))
+	}
+	switch subtitleMode {
+	case "auto", "receiver", "burn", "off":
+	default:
+		return s.sendInvalidParams("beam_media", args.TargetDevice, "", startedAt, id)
+	}
 
 	result, err := s.beamController.BeamMedia(ctx, domain.BeamRequest{
-		Source:        args.Source,
-		TargetDevice:  args.TargetDevice,
-		Transcode:     transcode,
-		SubtitlesPath: subtitlesPath,
-		StartSeconds:  args.StartSeconds,
+		Source:                args.Source,
+		TargetDevice:          args.TargetDevice,
+		Transcode:             transcode,
+		SubtitlesPath:         subtitlesPath,
+		StartSeconds:          args.StartSeconds,
+		TorrentFileIndex:      args.TorrentFileIndex,
+		SubtitleMode:          subtitleMode,
+		EmbeddedSubtitleTrack: args.EmbeddedSubtitleTrack,
 	})
 	if err != nil {
 		s.logCall("beam_media", args.TargetDevice, "", startedAt, toolErrorCode(err))
@@ -357,7 +627,7 @@ func (s *Server) handleBeamMediaCall(ctx context.Context, id json.RawMessage, ra
 	})
 }
 
-func (s *Server) handleStopBeamingCall(ctx context.Context, id json.RawMessage, rawArgs json.RawMessage) error {
+func (s requestHandler) handleStopBeamingCall(ctx context.Context, id json.RawMessage, rawArgs json.RawMessage) error {
 	startedAt := time.Now()
 
 	if s.beamController == nil {
@@ -413,7 +683,7 @@ func (s *Server) handleStopBeamingCall(ctx context.Context, id json.RawMessage, 
 	})
 }
 
-func (s *Server) handlePlaybackControlCall(ctx context.Context, id json.RawMessage, rawArgs json.RawMessage, toolName string) error {
+func (s requestHandler) handlePlaybackControlCall(ctx context.Context, id json.RawMessage, rawArgs json.RawMessage, toolName string) error {
 	startedAt := time.Now()
 
 	if s.beamController == nil {
@@ -483,7 +753,7 @@ func (s *Server) handlePlaybackControlCall(ctx context.Context, id json.RawMessa
 	})
 }
 
-func (s *Server) handleSeekBeamingCall(ctx context.Context, id json.RawMessage, rawArgs json.RawMessage) error {
+func (s requestHandler) handleSeekBeamingCall(ctx context.Context, id json.RawMessage, rawArgs json.RawMessage) error {
 	startedAt := time.Now()
 
 	if s.beamController == nil {
@@ -583,7 +853,7 @@ func (s *Server) handleSeekBeamingCall(ctx context.Context, id json.RawMessage, 
 	})
 }
 
-func (s *Server) handleGetBeamingStatusCall(ctx context.Context, id json.RawMessage, rawArgs json.RawMessage) error {
+func (s requestHandler) handleGetBeamingStatusCall(ctx context.Context, id json.RawMessage, rawArgs json.RawMessage) error {
 	startedAt := time.Now()
 
 	if s.beamController == nil {
@@ -639,7 +909,7 @@ func (s *Server) handleGetBeamingStatusCall(ctx context.Context, id json.RawMess
 	})
 }
 
-func (s *Server) handleListLocalHardwareCall(ctx context.Context, id json.RawMessage, rawArgs json.RawMessage) error {
+func (s requestHandler) handleListLocalHardwareCall(ctx context.Context, id json.RawMessage, rawArgs json.RawMessage) error {
 	startedAt := time.Now()
 
 	if s.localHardwareLister == nil {
@@ -707,6 +977,78 @@ func (s *Server) handleListLocalHardwareCall(ctx context.Context, id json.RawMes
 	})
 }
 
+// validateRequestMeta enforces the per-request protocol fields the modern
+// revision requires. The version is checked before the remaining fields so that
+// a client speaking a revision this server does not know is told to downgrade
+// rather than being told its request is malformed by this revision's rules.
+func validateRequestMeta(meta *requestMeta) *responseError {
+	if !meta.isModern() {
+		return &responseError{Code: -32602, Message: "invalid params"}
+	}
+
+	if !isSupportedProtocolVersion(*meta.ProtocolVersion) {
+		return &responseError{
+			Code:    errUnsupportedProtocolVersion,
+			Message: "Unsupported protocol version",
+			Data: unsupportedVersionData{
+				Supported: supportedProtocolVersions,
+				Requested: *meta.ProtocolVersion,
+			},
+		}
+	}
+
+	if !meta.hasClientCapabilities() {
+		return &responseError{Code: -32602, Message: "invalid params"}
+	}
+
+	return nil
+}
+
+func serverCapabilities() map[string]any {
+	return map[string]any{
+		"tools": map[string]any{
+			"listChanged": false,
+		},
+	}
+}
+
+// finalizeResult stamps the fields every modern result carries: the mandatory
+// `resultType`, the cache hints required of a CacheableResult, and the
+// recommended server identity. Applying it centrally in the send path is what
+// guarantees no handler can omit them.
+//
+// On a legacy exchange results are handed back untouched, so a legacy client
+// sees only its own revision's shape: the modern-only fields are all omitempty
+// and stay absent.
+func (s requestHandler) finalizeResult(result any) any {
+	if !s.modern {
+		return result
+	}
+
+	ttl := staticListTTLMs
+
+	switch typed := result.(type) {
+	case discoverResult:
+		typed.ResultType = resultTypeComplete
+		typed.TTLMs = &ttl
+		typed.CacheScope = cacheScopePublic
+		typed.Meta = s.resultMeta
+		return typed
+	case toolsListResult:
+		typed.ResultType = resultTypeComplete
+		typed.TTLMs = &ttl
+		typed.CacheScope = cacheScopePublic
+		typed.Meta = s.resultMeta
+		return typed
+	case toolCallResult:
+		typed.ResultType = resultTypeComplete
+		typed.Meta = s.resultMeta
+		return typed
+	default:
+		return result
+	}
+}
+
 func decodeStrict(raw json.RawMessage, out any) error {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
@@ -723,7 +1065,7 @@ func decodeStrict(raw json.RawMessage, out any) error {
 	return nil
 }
 
-func (s *Server) sendInvalidParams(method, deviceID, sessionID string, startedAt time.Time, id json.RawMessage) error {
+func (s requestHandler) sendInvalidParams(method, deviceID, sessionID string, startedAt time.Time, id json.RawMessage) error {
 	s.logCall(method, deviceID, sessionID, startedAt, "-32602")
 	return s.send(response{
 		JSONRPC: "2.0",
@@ -735,7 +1077,7 @@ func (s *Server) sendInvalidParams(method, deviceID, sessionID string, startedAt
 	})
 }
 
-func (s *Server) sendToolInternalError(method, deviceID, sessionID string, startedAt time.Time, id json.RawMessage, message string) error {
+func (s requestHandler) sendToolInternalError(method, deviceID, sessionID string, startedAt time.Time, id json.RawMessage, message string) error {
 	s.logCall(method, deviceID, sessionID, startedAt, "INTERNAL_ERROR")
 	return s.send(response{
 		JSONRPC: "2.0",
@@ -817,6 +1159,22 @@ func (s *Server) logCall(method, deviceID, sessionID string, startedAt time.Time
 	)
 }
 
+func (s requestHandler) send(resp response) error {
+	if s.call != nil {
+		s.inflightMu.Lock()
+		// A cancelled request produces no response. Marking the send transition
+		// under the same lock makes a late cancellation harmless.
+		if s.call.cancelled || s.call.ctx.Err() != nil {
+			s.inflightMu.Unlock()
+			return nil
+		}
+		s.call.responding = true
+		s.inflightMu.Unlock()
+	}
+	resp.Result = s.finalizeResult(resp.Result)
+	return s.Server.send(resp)
+}
+
 func (s *Server) send(resp response) error {
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
@@ -879,6 +1237,19 @@ func formatDiscoveredDevices(devices []domain.Device) string {
 	return out.String()
 }
 
+func formatTorrentFiles(files []domain.TorrentFile) string {
+	if len(files) == 0 {
+		return "Torrent contains no supported media files to beam."
+	}
+
+	var out strings.Builder
+	fmt.Fprintf(&out, "Torrent contains %d supported media files. Pass the desired original index as beam_media.arguments.torrent_file_index.", len(files))
+	for _, file := range files {
+		fmt.Fprintf(&out, "\nindex=%d name=%q size_bytes=%d", file.Index, file.Name, file.Size)
+	}
+	return out.String()
+}
+
 func formatBeamingStatusText(result *domain.StatusResult) string {
 	if result == nil {
 		return "No beaming status available."
@@ -895,6 +1266,11 @@ func formatBeamingStatusText(result *domain.StatusResult) string {
 	}
 	if strings.TrimSpace(result.Title) != "" {
 		fmt.Fprintf(&out, " Title: %s.", strings.TrimSpace(result.Title))
+	}
+	if result.Torrent != nil {
+		fmt.Fprintf(&out, " Torrent file %s: %.1f%% downloaded (%d/%d bytes).",
+			result.Torrent.FileName, result.Torrent.ProgressPercent,
+			result.Torrent.DownloadedBytes, result.Torrent.TotalBytes)
 	}
 	return out.String()
 }
@@ -923,9 +1299,31 @@ func staticTools() []tool {
 			},
 		},
 		{
+			Name:        "inspect_torrent",
+			Description: "Inspect files in a local .torrent file or magnet URI before casting. Returns file indices, names, and sizes without starting playback. When multiple supported media files are present, choose an index and pass it as torrent_file_index to beam_media.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"source": map[string]any{
+						"type":        "string",
+						"description": "Absolute local path to a .torrent file or a magnet URI. Magnet metadata retrieval may take time depending on available peers.",
+					},
+					"timeout_ms": map[string]any{
+						"type":        "integer",
+						"minimum":     minTorrentTimeoutMS,
+						"maximum":     maxTorrentTimeoutMS,
+						"default":     defaultTorrentTimeoutMS,
+						"description": "Timeout in milliseconds for torrent preparation and metadata retrieval.",
+					},
+				},
+				"required":             []string{"source"},
+				"additionalProperties": false,
+			},
+		},
+		{
 			Name: "beam_media",
 			Description: "Cast or stream media (video, audio, etc.) to a selected local Smart TV, Chromecast, or UPnP/DLNA device. " +
-				"You must provide a valid target_device ID or name. " +
+				"You must provide a valid target_device ID or name. Local .torrent files and magnet URIs are supported; torrents with multiple supported media files require an explicit torrent_file_index from inspect_torrent. Torrent metadata retrieval has a 60-second timeout; subsequent media preparation and device startup can take additional time. " +
 				"Returns a session_id accepted by the other beaming tools. Sessions live only in this server process: they are lost if it restarts, " +
 				"and are reclaimed automatically after about 10 minutes idle or stalled, 90 minutes paused, or 24 hours in total. " +
 				"If a session_id is no longer recognized, start a new beam rather than retrying with it.",
@@ -934,7 +1332,7 @@ func staticTools() []tool {
 				"properties": map[string]any{
 					"source": map[string]any{
 						"type":        "string",
-						"description": "The absolute local file path (e.g., /home/user/movie.mp4) or a valid HTTP/HTTPS URL of the media to cast.",
+						"description": "Absolute local media path, HTTP/HTTPS media URL, absolute local .torrent path, or magnet URI.",
 					},
 					"target_device": map[string]any{
 						"type":        "string",
@@ -948,7 +1346,23 @@ func staticTools() []tool {
 					},
 					"subtitles_path": map[string]any{
 						"type":        "string",
-						"description": "Optional absolute local file path to a subtitle file (e.g., .srt, .vtt) to load with the media.",
+						"description": "Optional absolute local path to an external subtitle file (e.g., .srt, .vtt). Takes precedence over sidecar and embedded subtitles.",
+					},
+					"torrent_file_index": map[string]any{
+						"type":        "integer",
+						"minimum":     0,
+						"description": "File index returned by inspect_torrent. Required when multiple supported media files are present; optional when there is exactly one supported media file.",
+					},
+					"subtitle_mode": map[string]any{
+						"type":        "string",
+						"enum":        []string{"auto", "receiver", "burn", "off"},
+						"default":     "auto",
+						"description": "Subtitle rendering: auto selects a compatible path; receiver sends subtitles to the device and cannot render bitmap tracks; burn embeds subtitles in video and implies transcoding (incompatible with transcode=never); off disables subtitles.",
+					},
+					"embedded_subtitle_track": map[string]any{
+						"type":        "integer",
+						"minimum":     0,
+						"description": "Zero-based subtitle track index in a local media file; unavailable for torrent sources. External subtitles_path takes precedence.",
 					},
 					"start_seconds": map[string]any{
 						"type":        "integer",
@@ -962,7 +1376,7 @@ func staticTools() []tool {
 		},
 		{
 			Name:        "get_beaming_status",
-			Description: "Get current playback status for an active beaming session, including state, position, duration, title, and content type when available.",
+			Description: "Get current playback status for an active beaming session, including state, position, duration, title, content type, and torrent download progress when available.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{

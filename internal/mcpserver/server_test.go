@@ -28,28 +28,38 @@ type fakeLocalHardwareLister struct {
 }
 
 type fakeBeamController struct {
-	mu           sync.Mutex
-	beamReq      domain.BeamRequest
-	beamResult   *domain.BeamResult
-	beamErr      error
-	stopReq      domain.StopRequest
-	stopResult   *domain.StopResult
-	stopErr      error
-	playReq      domain.PlaybackControlRequest
-	playResult   *domain.PlaybackControlResult
-	playErr      error
-	pauseReq     domain.PlaybackControlRequest
-	pauseResult  *domain.PlaybackControlResult
-	pauseErr     error
-	seekReq      domain.SeekRequest
-	seekResult   *domain.SeekResult
-	seekErr      error
-	statusReq    domain.StatusRequest
-	statusResult *domain.StatusResult
-	statusErr    error
-	beamBlock    <-chan struct{}
-	beamCalled   chan struct{}
-	beamOnce     sync.Once
+	mu            sync.Mutex
+	beamReq       domain.BeamRequest
+	beamResult    *domain.BeamResult
+	beamErr       error
+	stopReq       domain.StopRequest
+	stopResult    *domain.StopResult
+	stopErr       error
+	playReq       domain.PlaybackControlRequest
+	playResult    *domain.PlaybackControlResult
+	playErr       error
+	pauseReq      domain.PlaybackControlRequest
+	pauseResult   *domain.PlaybackControlResult
+	pauseErr      error
+	seekReq       domain.SeekRequest
+	seekResult    *domain.SeekResult
+	seekErr       error
+	statusReq     domain.StatusRequest
+	statusResult  *domain.StatusResult
+	statusErr     error
+	beamBlock     <-chan struct{}
+	beamCalled    chan struct{}
+	beamOnce      sync.Once
+	inspectReq    domain.InspectTorrentRequest
+	inspectResult *domain.InspectTorrentResult
+	inspectErr    error
+}
+
+func (f *fakeBeamController) InspectTorrent(ctx context.Context, req domain.InspectTorrentRequest) (*domain.InspectTorrentResult, error) {
+	f.mu.Lock()
+	f.inspectReq = req
+	f.mu.Unlock()
+	return f.inspectResult, f.inspectErr
 }
 
 func (f *fakeBeamController) BeamMedia(ctx context.Context, req domain.BeamRequest) (*domain.BeamResult, error) {
@@ -150,8 +160,8 @@ func TestInitializeAndToolsList(t *testing.T) {
 
 	toolResult := responses[1]["result"].(map[string]any)
 	tools := toolResult["tools"].([]any)
-	if len(tools) != 7 {
-		t.Fatalf("expected 7 tools, got %d", len(tools))
+	if len(tools) != 8 {
+		t.Fatalf("expected 8 tools, got %d", len(tools))
 	}
 }
 
@@ -791,6 +801,127 @@ func TestToolsCallCanRunConcurrently(t *testing.T) {
 	}
 	if !seen[81] || !seen[82] {
 		t.Fatalf("expected responses for ids 81 and 82, got %+v", seen)
+	}
+}
+
+func TestConcurrentToolCallsPreserveProtocolEra(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		modern bool
+		err    error
+	}{
+		{name: "modern_success", modern: true},
+		{name: "legacy_success"},
+		{name: "modern_error", modern: true, err: &domain.ToolError{Code: "FILE_NOT_FOUND", Message: "missing media"}},
+		{name: "legacy_error", err: &domain.ToolError{Code: "FILE_NOT_FOUND", Message: "missing media"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			output := &bytes.Buffer{}
+			called := make(chan struct{})
+			release := make(chan struct{})
+			controller := &fakeBeamController{
+				beamResult: &domain.BeamResult{OK: true, SessionID: "sess_slow", DeviceID: "dev_slow"},
+				beamErr:    tc.err,
+				beamCalled: called,
+				beamBlock:  release,
+			}
+			srv := New(&bytes.Buffer{}, output, Config{
+				ServerName:     "mcp-beam",
+				ServerVersion:  "1.0.0-test",
+				BeamController: controller,
+			})
+			var releaseOnce sync.Once
+			releaseCall := func() { releaseOnce.Do(func() { close(release) }) }
+			t.Cleanup(func() {
+				releaseCall()
+				srv.inflightTools.Wait()
+			})
+
+			callParams := map[string]any{
+				"name": "beam_media",
+				"arguments": map[string]any{
+					"source":        "/tmp/media.mkv",
+					"target_device": "dev_slow",
+				},
+			}
+			if tc.modern {
+				callParams["_meta"] = modernMeta()
+			}
+			call, err := json.Marshal(map[string]any{
+				"jsonrpc": "2.0", "id": "slow", "method": "tools/call", "params": callParams,
+			})
+			if err != nil {
+				t.Fatalf("marshal tool call: %v", err)
+			}
+			if err := srv.handle(context.Background(), call); err != nil {
+				t.Fatalf("handle tool call: %v", err)
+			}
+			select {
+			case <-called:
+			case <-time.After(time.Second):
+				t.Fatal("tool call did not start")
+			}
+
+			// Finish a request from the other era while the tool call is blocked.
+			listParams := map[string]any{}
+			if !tc.modern {
+				listParams["_meta"] = modernMeta()
+			}
+			list, err := json.Marshal(map[string]any{
+				"jsonrpc": "2.0", "id": "later", "method": "tools/list", "params": listParams,
+			})
+			if err != nil {
+				t.Fatalf("marshal tools/list: %v", err)
+			}
+			if err := srv.handle(context.Background(), list); err != nil {
+				t.Fatalf("handle tools/list: %v", err)
+			}
+			releaseCall()
+			srv.inflightTools.Wait()
+
+			responses := readResponses(t, output.Bytes())
+			if len(responses) != 2 {
+				t.Fatalf("expected two responses, got %d", len(responses))
+			}
+			for i, response := range responses {
+				id, modern := "later", !tc.modern
+				if i == 1 {
+					id, modern = "slow", tc.modern
+				}
+				if response["id"] != id {
+					t.Fatalf("expected response for %q, got %#v", id, response)
+				}
+				result, ok := response["result"].(map[string]any)
+				if !ok {
+					t.Fatalf("expected result for %q, got %#v", id, response)
+				}
+				if modern {
+					if result["resultType"] != "complete" {
+						t.Fatalf("modern response for %q must retain resultType: %#v", id, result)
+					}
+					meta, ok := result["_meta"].(map[string]any)
+					if !ok {
+						t.Fatalf("modern response for %q must retain server identity: %#v", id, result)
+					}
+					info, ok := meta[metaServerInfo].(map[string]any)
+					if !ok || info["name"] != "mcp-beam" || info["version"] != "1.0.0-test" {
+						t.Fatalf("unexpected server identity for %q: %#v", id, meta)
+					}
+				} else {
+					for _, field := range modernOnlyResultFields {
+						if _, exists := result[field]; exists {
+							t.Fatalf("legacy response for %q must omit %q: %#v", id, field, result)
+						}
+					}
+				}
+				if id == "slow" {
+					isError, _ := result["isError"].(bool)
+					if isError != (tc.err != nil) {
+						t.Fatalf("unexpected tool error status: %#v", result)
+					}
+				}
+			}
+		})
 	}
 }
 
@@ -1663,6 +1794,452 @@ func TestDecodeStrictRejectsTrailingJSON(t *testing.T) {
 	}
 }
 
+// A client omitting `arguments` falls through to the flattening path, which
+// must treat multi round-trip params as protocol-level rather than folding them
+// into the tool's arguments and failing strict decoding.
+func TestToolsCallIgnoresMultiRoundTripParamsWhenFlattening(t *testing.T) {
+	input := bytes.NewBuffer(nil)
+	output := bytes.NewBuffer(nil)
+
+	lister := &fakeLocalHardwareLister{devices: []domain.Device{{ID: "dev-1", Name: "TV"}}}
+	writeJSONLineRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name":           "list_local_hardware",
+			"inputResponses": map[string]any{"login": map[string]any{"action": "accept"}},
+			"requestState":   "eyJsb2NhdGlvbiI6Ik5ldyBZb3JrIn0",
+			"_meta":          modernMeta(),
+		},
+	})
+
+	srv := New(input, output, Config{LocalHardwareLister: lister})
+	if err := srv.Run(context.Background()); err != nil {
+		t.Fatalf("run server: %v", err)
+	}
+
+	responses := readResponses(t, output.Bytes())
+	if len(responses) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(responses))
+	}
+	if respErr, isError := responses[0]["error"]; isError {
+		t.Fatalf("multi round-trip params must not be folded into arguments: %#v", respErr)
+	}
+	if responses[0]["result"].(map[string]any)["isError"] == true {
+		t.Fatalf("expected a successful call: %#v", responses[0]["result"])
+	}
+}
+
+func TestDecodeToolCallParamsSeparatesProtocolParamsFromArguments(t *testing.T) {
+	params, err := decodeToolCallParams(json.RawMessage(
+		`{"name":"seek_beaming","requestState":"abc","mode":"percent","value":50}`,
+	))
+	if err != nil {
+		t.Fatalf("decode params: %v", err)
+	}
+	if params.Name != "seek_beaming" {
+		t.Fatalf("name mismatch: %q", params.Name)
+	}
+
+	var arguments map[string]any
+	if err := json.Unmarshal(params.Arguments, &arguments); err != nil {
+		t.Fatalf("unmarshal arguments: %v", err)
+	}
+	if _, exists := arguments["requestState"]; exists {
+		t.Fatalf("requestState must not appear in arguments: %#v", arguments)
+	}
+	if arguments["mode"] != "percent" || arguments["value"].(float64) != 50 {
+		t.Fatalf("tool arguments must survive flattening: %#v", arguments)
+	}
+}
+
+// modernMeta builds the per-request `_meta` a 2026-07-28 client sends.
+func modernMeta() map[string]any {
+	return map[string]any{
+		"io.modelcontextprotocol/protocolVersion": "2026-07-28",
+		"io.modelcontextprotocol/clientInfo": map[string]any{
+			"name":    "test-client",
+			"version": "1.0.0",
+		},
+		"io.modelcontextprotocol/clientCapabilities": map[string]any{},
+	}
+}
+
+func TestServerDiscoverReturnsModernResult(t *testing.T) {
+	input := bytes.NewBuffer(nil)
+	output := bytes.NewBuffer(nil)
+
+	writeJSONLineRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      "discover-1",
+		"method":  "server/discover",
+		"params":  map[string]any{"_meta": modernMeta()},
+	})
+
+	srv := New(input, output, Config{ServerName: "mcp-beam", ServerVersion: "1.0.0-test"})
+	if err := srv.Run(context.Background()); err != nil {
+		t.Fatalf("run server: %v", err)
+	}
+
+	responses := readResponses(t, output.Bytes())
+	if len(responses) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(responses))
+	}
+	if responses[0]["id"].(string) != "discover-1" {
+		t.Fatalf("discover response id mismatch: %#v", responses[0]["id"])
+	}
+
+	result, ok := responses[0]["result"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected result, got %#v", responses[0])
+	}
+	if result["resultType"].(string) != "complete" {
+		t.Fatalf("resultType mismatch: %#v", result["resultType"])
+	}
+
+	versions := result["supportedVersions"].([]any)
+	if len(versions) == 0 || versions[0].(string) != "2026-07-28" {
+		t.Fatalf("supportedVersions must lead with the modern revision: %#v", versions)
+	}
+
+	capabilities := result["capabilities"].(map[string]any)
+	if _, exists := capabilities["tools"]; !exists {
+		t.Fatalf("capabilities must declare tools: %#v", capabilities)
+	}
+
+	// server/discover is a cacheable result: both hints are mandatory.
+	if result["ttlMs"].(float64) <= 0 {
+		t.Fatalf("ttlMs must be a positive freshness hint: %#v", result["ttlMs"])
+	}
+	if result["cacheScope"].(string) != "public" {
+		t.Fatalf("cacheScope mismatch: %#v", result["cacheScope"])
+	}
+
+	meta := result["_meta"].(map[string]any)
+	serverInfo := meta["io.modelcontextprotocol/serverInfo"].(map[string]any)
+	if serverInfo["name"].(string) != "mcp-beam" || serverInfo["version"].(string) != "1.0.0-test" {
+		t.Fatalf("serverInfo mismatch: %#v", serverInfo)
+	}
+}
+
+func TestModernToolsListCarriesResultTypeAndCachingHints(t *testing.T) {
+	input := bytes.NewBuffer(nil)
+	output := bytes.NewBuffer(nil)
+
+	writeJSONLineRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "tools/list",
+		"params":  map[string]any{"_meta": modernMeta()},
+	})
+
+	srv := New(input, output, Config{ServerName: "mcp-beam", ServerVersion: "1.0.0-test"})
+	if err := srv.Run(context.Background()); err != nil {
+		t.Fatalf("run server: %v", err)
+	}
+
+	responses := readResponses(t, output.Bytes())
+	if len(responses) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(responses))
+	}
+
+	result := responses[0]["result"].(map[string]any)
+	if result["resultType"].(string) != "complete" {
+		t.Fatalf("resultType mismatch: %#v", result["resultType"])
+	}
+	if len(result["tools"].([]any)) != 8 {
+		t.Fatalf("expected 8 tools, got %d", len(result["tools"].([]any)))
+	}
+	if result["ttlMs"].(float64) <= 0 {
+		t.Fatalf("ttlMs must be a positive freshness hint: %#v", result["ttlMs"])
+	}
+	if result["cacheScope"].(string) != "public" {
+		t.Fatalf("cacheScope mismatch: %#v", result["cacheScope"])
+	}
+	if _, exists := result["_meta"].(map[string]any)["io.modelcontextprotocol/serverInfo"]; !exists {
+		t.Fatalf("result _meta must carry serverInfo: %#v", result["_meta"])
+	}
+}
+
+func TestModernToolsCallCarriesResultType(t *testing.T) {
+	input := bytes.NewBuffer(nil)
+	output := bytes.NewBuffer(nil)
+
+	lister := &fakeLocalHardwareLister{devices: []domain.Device{{ID: "dev-1", Name: "TV"}}}
+	writeJSONLineRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name":      "list_local_hardware",
+			"arguments": map[string]any{},
+			"_meta":     modernMeta(),
+		},
+	})
+
+	srv := New(input, output, Config{LocalHardwareLister: lister})
+	if err := srv.Run(context.Background()); err != nil {
+		t.Fatalf("run server: %v", err)
+	}
+
+	responses := readResponses(t, output.Bytes())
+	if len(responses) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(responses))
+	}
+
+	result := responses[0]["result"].(map[string]any)
+	if result["resultType"].(string) != "complete" {
+		t.Fatalf("resultType mismatch: %#v", result["resultType"])
+	}
+	// tools/call is not a cacheable operation; hints must not appear.
+	if _, exists := result["ttlMs"]; exists {
+		t.Fatalf("tools/call result must not carry caching hints: %#v", result)
+	}
+}
+
+// Tool execution errors are results, not protocol errors, so they carry the
+// same modern envelope as a successful call.
+func TestModernToolErrorResultCarriesResultType(t *testing.T) {
+	input := bytes.NewBuffer(nil)
+	output := bytes.NewBuffer(nil)
+
+	writeJSONLineRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      3,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name":      "does_not_exist",
+			"arguments": map[string]any{},
+			"_meta":     modernMeta(),
+		},
+	})
+
+	srv := New(input, output, Config{})
+	if err := srv.Run(context.Background()); err != nil {
+		t.Fatalf("run server: %v", err)
+	}
+
+	responses := readResponses(t, output.Bytes())
+	if len(responses) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(responses))
+	}
+
+	result := responses[0]["result"].(map[string]any)
+	if result["resultType"].(string) != "complete" {
+		t.Fatalf("resultType mismatch: %#v", result["resultType"])
+	}
+	if result["isError"] != true {
+		t.Fatalf("expected isError: %#v", result)
+	}
+}
+
+func TestUnsupportedProtocolVersionIsRejected(t *testing.T) {
+	input := bytes.NewBuffer(nil)
+	output := bytes.NewBuffer(nil)
+
+	meta := modernMeta()
+	meta["io.modelcontextprotocol/protocolVersion"] = "1900-01-01"
+	writeJSONLineRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "tools/list",
+		"params":  map[string]any{"_meta": meta},
+	})
+
+	srv := New(input, output, Config{})
+	if err := srv.Run(context.Background()); err != nil {
+		t.Fatalf("run server: %v", err)
+	}
+
+	responses := readResponses(t, output.Bytes())
+	if len(responses) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(responses))
+	}
+
+	respErr := responses[0]["error"].(map[string]any)
+	if respErr["code"].(float64) != -32022 {
+		t.Fatalf("expected -32022, got %#v", respErr["code"])
+	}
+
+	data := respErr["data"].(map[string]any)
+	if data["requested"].(string) != "1900-01-01" {
+		t.Fatalf("data.requested mismatch: %#v", data["requested"])
+	}
+	supported := data["supported"].([]any)
+	if len(supported) == 0 || supported[0].(string) != "2026-07-28" {
+		t.Fatalf("data.supported must list the versions to retry with: %#v", supported)
+	}
+}
+
+// A modern client that omits a required _meta field has sent a malformed
+// request, regardless of which method it called.
+func TestModernRequestMissingClientCapabilitiesIsInvalidParams(t *testing.T) {
+	input := bytes.NewBuffer(nil)
+	output := bytes.NewBuffer(nil)
+
+	writeJSONLineRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "tools/list",
+		"params": map[string]any{
+			"_meta": map[string]any{
+				"io.modelcontextprotocol/protocolVersion": "2026-07-28",
+			},
+		},
+	})
+
+	srv := New(input, output, Config{})
+	if err := srv.Run(context.Background()); err != nil {
+		t.Fatalf("run server: %v", err)
+	}
+
+	responses := readResponses(t, output.Bytes())
+	if len(responses) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(responses))
+	}
+	if responses[0]["error"].(map[string]any)["code"].(float64) != -32602 {
+		t.Fatalf("expected -32602, got %#v", responses[0]["error"])
+	}
+}
+
+// server/discover exists only in the modern revision, so it is validated even
+// when the client sends no _meta at all.
+func TestServerDiscoverWithoutMetaIsInvalidParams(t *testing.T) {
+	input := bytes.NewBuffer(nil)
+	output := bytes.NewBuffer(nil)
+
+	writeJSONLineRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "server/discover",
+	})
+
+	srv := New(input, output, Config{})
+	if err := srv.Run(context.Background()); err != nil {
+		t.Fatalf("run server: %v", err)
+	}
+
+	responses := readResponses(t, output.Bytes())
+	if len(responses) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(responses))
+	}
+	if responses[0]["error"].(map[string]any)["code"].(float64) != -32602 {
+		t.Fatalf("expected -32602, got %#v", responses[0]["error"])
+	}
+}
+
+// The dual-era contract: a legacy client sends no _meta and must be served
+// exactly as before, with the legacy handshake shape unchanged.
+func TestLegacyInitializeIsUnaffectedByModernValidation(t *testing.T) {
+	input := bytes.NewBuffer(nil)
+	output := bytes.NewBuffer(nil)
+
+	writeRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "initialize",
+		"params":  map[string]any{},
+	})
+	writeRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "tools/list",
+	})
+
+	srv := New(input, output, Config{ServerName: "mcp-beam", ServerVersion: "1.0.0-test"})
+	if err := srv.Run(context.Background()); err != nil {
+		t.Fatalf("run server: %v", err)
+	}
+
+	responses := readResponses(t, output.Bytes())
+	if len(responses) != 2 {
+		t.Fatalf("expected 2 responses, got %d", len(responses))
+	}
+
+	initResult := responses[0]["result"].(map[string]any)
+	if initResult["protocolVersion"].(string) != "2024-11-05" {
+		t.Fatalf("legacy handshake must keep advertising its own revision: %#v", initResult["protocolVersion"])
+	}
+	// The legacy reply keeps serverInfo where its own revision puts it, and
+	// gains none of the modern per-result fields.
+	if _, exists := initResult["serverInfo"].(map[string]any); !exists {
+		t.Fatalf("legacy initialize must carry top-level serverInfo: %#v", initResult)
+	}
+	if _, exists := initResult["resultType"]; exists {
+		t.Fatalf("legacy initialize must not carry resultType: %#v", initResult)
+	}
+
+	if len(responses[1]["result"].(map[string]any)["tools"].([]any)) != 8 {
+		t.Fatalf("legacy tools/list must still list every tool")
+	}
+}
+
+// An `initialize` request selects legacy semantics even when it carries modern
+// _meta, so it must never be answered with a modern result or a version error.
+func TestInitializeWithModernMetaStillSelectsLegacySemantics(t *testing.T) {
+	input := bytes.NewBuffer(nil)
+	output := bytes.NewBuffer(nil)
+
+	meta := modernMeta()
+	meta["io.modelcontextprotocol/protocolVersion"] = "1900-01-01"
+	writeJSONLineRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "initialize",
+		"params":  map[string]any{"_meta": meta},
+	})
+
+	srv := New(input, output, Config{ServerName: "mcp-beam", ServerVersion: "1.0.0-test"})
+	if err := srv.Run(context.Background()); err != nil {
+		t.Fatalf("run server: %v", err)
+	}
+
+	responses := readResponses(t, output.Bytes())
+	if len(responses) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(responses))
+	}
+	if _, isError := responses[0]["error"]; isError {
+		t.Fatalf("initialize must not be version-checked: %#v", responses[0])
+	}
+	if responses[0]["result"].(map[string]any)["protocolVersion"].(string) != "2024-11-05" {
+		t.Fatalf("expected the legacy handshake reply: %#v", responses[0]["result"])
+	}
+}
+
+func TestDecodeRequestMetaTreatsAbsentMetaAsLegacy(t *testing.T) {
+	for name, params := range map[string]string{
+		"absent params": "",
+		"null params":   "null",
+		"empty object":  "{}",
+		"no meta key":   `{"name":"list_local_hardware"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			meta, err := decodeRequestMeta(json.RawMessage(params))
+			if err != nil {
+				t.Fatalf("decode meta: %v", err)
+			}
+			if meta.isModern() {
+				t.Fatalf("expected legacy era for %q", params)
+			}
+		})
+	}
+}
+
+// writeJSONLineRequest uses the newline-delimited framing the stdio binding
+// defines. writeRequest exercises the legacy Content-Length framing instead.
+func writeJSONLineRequest(t *testing.T, w io.Writer, req map[string]any) {
+	t.Helper()
+
+	payload, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	if _, err := w.Write(append(payload, '\n')); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+}
+
 func writeRequest(t *testing.T, w io.Writer, req map[string]any) {
 	t.Helper()
 
@@ -1707,6 +2284,148 @@ func readResponses(t *testing.T, output []byte) []map[string]any {
 	}
 
 	return responses
+}
+
+// modernOnlyResultFields are the fields the 2026-07-28 revision adds to results.
+// A legacy client negotiated a revision that defines none of them, so none may
+// appear in anything it is served after the `initialize` handshake.
+var modernOnlyResultFields = []string{"resultType", "ttlMs", "cacheScope", "_meta"}
+
+// After an `initialize` handshake selects legacy semantics, every later result
+// must stay within the legacy revision's shape. Without era selection the send
+// path stamps modern fields onto results regardless of who asked for them.
+func TestLegacyEraResultsCarryNoModernFields(t *testing.T) {
+	input := bytes.NewBuffer(nil)
+	output := bytes.NewBuffer(nil)
+
+	writeRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "initialize",
+		"params":  map[string]any{},
+	})
+	writeRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "tools/list",
+	})
+	writeRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      3,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name":      "list_local_hardware",
+			"arguments": map[string]any{},
+		},
+	})
+
+	srv := New(input, output, Config{
+		ServerName:          "mcp-beam",
+		ServerVersion:       "1.0.0-test",
+		LocalHardwareLister: &fakeLocalHardwareLister{},
+	})
+	if err := srv.Run(context.Background()); err != nil {
+		t.Fatalf("run server: %v", err)
+	}
+
+	responses := readResponses(t, output.Bytes())
+	if len(responses) != 3 {
+		t.Fatalf("expected 3 responses, got %d", len(responses))
+	}
+
+	for _, response := range responses {
+		result, ok := response["result"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected a result, got %#v", response)
+		}
+		for _, field := range modernOnlyResultFields {
+			if _, exists := result[field]; exists {
+				t.Fatalf("legacy result for id %#v must not carry %q: %#v", response["id"], field, result)
+			}
+		}
+	}
+
+	// The legacy payloads themselves must survive intact.
+	if len(responses[1]["result"].(map[string]any)["tools"].([]any)) != 8 {
+		t.Fatalf("legacy tools/list must still list every tool")
+	}
+	if len(responses[2]["result"].(map[string]any)["content"].([]any)) == 0 {
+		t.Fatalf("legacy tools/call must still carry content")
+	}
+}
+
+// A legacy client that never sends `initialize` -- calling tools/list directly
+// with no `_meta` -- is still an era-ambiguous request served under legacy
+// semantics, so it must not be handed modern-only fields either.
+func TestRequestWithoutMetaCarriesNoModernFields(t *testing.T) {
+	input := bytes.NewBuffer(nil)
+	output := bytes.NewBuffer(nil)
+
+	writeRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "tools/list",
+	})
+
+	srv := New(input, output, Config{ServerName: "mcp-beam", ServerVersion: "1.0.0-test"})
+	if err := srv.Run(context.Background()); err != nil {
+		t.Fatalf("run server: %v", err)
+	}
+
+	responses := readResponses(t, output.Bytes())
+	if len(responses) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(responses))
+	}
+
+	result := responses[0]["result"].(map[string]any)
+	if len(result["tools"].([]any)) != 8 {
+		t.Fatalf("tools/list must list every tool: %#v", result)
+	}
+	if _, exists := result["resultType"]; exists {
+		t.Fatalf("an era-ambiguous result must not carry resultType: %#v", result)
+	}
+}
+
+// `server/discover` exists solely in the modern revision and always carries
+// modern `_meta`, so it keeps its modern shape even on a process that has
+// already answered a legacy `initialize`.
+func TestServerDiscoverStaysModernAfterLegacyInitialize(t *testing.T) {
+	input := bytes.NewBuffer(nil)
+	output := bytes.NewBuffer(nil)
+
+	writeJSONLineRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "initialize",
+		"params":  map[string]any{},
+	})
+	writeJSONLineRequest(t, input, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "server/discover",
+		"params":  map[string]any{"_meta": modernMeta()},
+	})
+
+	srv := New(input, output, Config{ServerName: "mcp-beam", ServerVersion: "1.0.0-test"})
+	if err := srv.Run(context.Background()); err != nil {
+		t.Fatalf("run server: %v", err)
+	}
+
+	responses := readResponses(t, output.Bytes())
+	if len(responses) != 2 {
+		t.Fatalf("expected 2 responses, got %d", len(responses))
+	}
+
+	discover := responses[1]["result"].(map[string]any)
+	if discover["resultType"].(string) != "complete" {
+		t.Fatalf("server/discover must stay modern: %#v", discover)
+	}
+	if discover["ttlMs"].(float64) <= 0 || discover["cacheScope"].(string) != "public" {
+		t.Fatalf("server/discover must keep its cache hints: %#v", discover)
+	}
+	if _, exists := discover["_meta"]; !exists {
+		t.Fatalf("server/discover must keep serverInfo: %#v", discover)
+	}
 }
 
 // A magnitude past int range converts to a large negative number. Every mode
