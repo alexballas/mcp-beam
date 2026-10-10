@@ -2999,3 +2999,41 @@ var (
 	_ adapters.DLNAFactory = (*fakeDLNAFactory)(nil)
 	_ adapters.DLNAPayload = (*fakeDLNAPayload)(nil)
 )
+
+// A device reporting a duration too large to convert yields a negative ceiling.
+// The clamp order must still leave a position the device can accept: on a
+// 32-bit build the threshold is only about 68 years of seconds, which a
+// renderer reporting microseconds would cross on an ordinary film.
+func TestSeekBeamingDeltaSurvivesUnconvertibleDuration(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	defer manager.Close(context.Background())
+
+	castClient := &fakeCastClient{
+		statuses: []castprotocol.CastStatus{
+			{PlayerState: "PLAYING", CurrentTime: 5, Duration: 1e19},
+		},
+	}
+	sess := &session{
+		ID:         "sess_seek_bad_duration",
+		DeviceID:   "dev_cast",
+		DeviceName: "Living Room",
+		Protocol:   "chromecast",
+		castClient: castClient,
+	}
+	manager.initializeSessionLifecycle(sess, "playing", "5")
+	if _, stored := manager.storeSession(sess); !stored {
+		t.Fatal("expected session to be stored")
+	}
+
+	skip := 20
+	result, err := manager.SeekBeaming(context.Background(), domain.SeekRequest{
+		SessionID:    "sess_seek_bad_duration",
+		DeltaSeconds: &skip,
+	})
+	if err != nil {
+		t.Fatalf("seek beaming: %v", err)
+	}
+	if result.ResolvedPositionSeconds < 0 {
+		t.Fatalf("must never resolve to a negative position, got %d", result.ResolvedPositionSeconds)
+	}
+}
