@@ -239,15 +239,24 @@ func (m *Manager) startDLNAServerAndPlay(ctx context.Context, device *domain.Dev
 		server.StopServer()
 		return nil, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to start DLNA media server: %v", err))
 	}
-	if err := m.withRetryAwait(startupCtx, func() error { return payload.SendtoTVContext(startupCtx, "Play1") }); err != nil {
+	// Play1 gets its own budget: go2tv waits up to 45s for a slow Play reply and
+	// then confirms through GetTransportInfo, which the shorter preparation
+	// deadline would cut off.
+	playCtx, cancelPlay := m.dlnaPlayContext(ctx)
+	defer cancelPlay()
+	if err := m.withRetryAwait(playCtx, func() error { return payload.SendtoTVContext(playCtx, "Play1") }); err != nil {
 		server.StopServer()
 		return nil, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to start DLNA playback: %v", err))
 	}
 	if !transcoding && startAtSeconds > 0 {
 		reltime := utils.SecondsToClockTime(startAtSeconds)
-		if err := m.withRetryAwait(startupCtx, func() error { return payload.SeekSoapCall(reltime) }); err != nil {
+		seekCtx, cancelSeek := m.operationContext(ctx)
+		defer cancelSeek()
+		if err := m.withRetryAwait(seekCtx, func() error { return payload.SeekSoapCallContext(seekCtx, reltime) }); err != nil {
 			server.StopServer()
-			_ = payload.SendtoTV("Stop")
+			// The payload context may already have expired with startup;
+			// stop with a fresh bounded context so playback does not linger.
+			_, _ = stopDLNAPayload(payload)
 			return nil, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to seek DLNA playback start position: %v", err))
 		}
 	}

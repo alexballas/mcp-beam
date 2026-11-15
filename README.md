@@ -476,6 +476,7 @@ Protocol notes:
 - Chromecast supports direct `.m3u8` HLS URL casting.
 - DLNA supports local files and URL sources with direct-first then proxy fallback behavior.
 - DLNA `.m3u8` URLs are rejected with structured limitation details.
+- Some DLNA renderers inspect a file before they acknowledge Play, so DLNA startup can wait up to 55 seconds for playback to begin.
 - When `subtitles_path` is omitted for local files, mcp-beam auto-detects sidecar subtitles using the same basename in this order: `.srt`, `.vtt`, `.ass`, then `.ssa`. An explicit `embedded_subtitle_track` selects that track instead of searching for sidecars.
 - `subtitle_mode=auto` chooses a compatible subtitle rendering path. `receiver` sends subtitles separately to the device and cannot render embedded bitmap tracks. `burn` renders subtitles into the video and implies transcoding; `off` disables subtitles.
 - `embedded_subtitle_track` selects a local embedded track; an explicit `subtitles_path` takes precedence.

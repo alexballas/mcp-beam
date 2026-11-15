@@ -41,6 +41,7 @@ const (
 
 	dlnaPollInterval      = 4 * time.Second
 	dlnaMonitorStopWait   = 500 * time.Millisecond
+	dlnaStopTimeout       = 10 * time.Second
 	dlnaCallbackQueueSize = 16
 
 	defaultIdleCleanupAfter   = 10 * time.Minute
@@ -52,7 +53,11 @@ const (
 	defaultRetryBaseBackoff = 120 * time.Millisecond
 	defaultRetryMaxBackoff  = 800 * time.Millisecond
 
-	defaultBeamOperationTimeout        = 12 * time.Second
+	defaultBeamOperationTimeout = 12 * time.Second
+	// defaultDLNAPlayStartTimeout covers go2tv's Play1 sequence: protocol
+	// info, subscribe and SetAVTransportURI, then up to 45s for the Play reply
+	// (renderers such as LG webOS probe large files before answering).
+	defaultDLNAPlayStartTimeout        = 55 * time.Second
 	defaultChromecastLoadDeadlineGrace = 4 * time.Second
 	defaultChromecastStatusPollEvery   = 250 * time.Millisecond
 
@@ -114,6 +119,7 @@ type Manager struct {
 	retryMaxBackoff  time.Duration
 
 	beamOperationTimeout        time.Duration
+	dlnaPlayStartTimeout        time.Duration
 	chromecastLoadDeadlineGrace time.Duration
 	chromecastStatusPollEvery   time.Duration
 
@@ -249,6 +255,7 @@ func NewManager(discovery deviceLister, castFactory adapters.CastFactory, dlnaFa
 		retryBaseBackoff:            defaultRetryBaseBackoff,
 		retryMaxBackoff:             defaultRetryMaxBackoff,
 		beamOperationTimeout:        defaultBeamOperationTimeout,
+		dlnaPlayStartTimeout:        defaultDLNAPlayStartTimeout,
 		chromecastLoadDeadlineGrace: defaultChromecastLoadDeadlineGrace,
 		chromecastStatusPollEvery:   defaultChromecastStatusPollEvery,
 		cleanupLoopCancel:           cleanupCancel,
@@ -344,6 +351,29 @@ func (m *Manager) operationContext(ctx context.Context) (context.Context, contex
 		return context.WithTimeout(ctx, m.beamOperationTimeout)
 	}
 	return context.WithCancel(ctx)
+}
+
+// dlnaPlayContext gives a DLNA Play1 its own budget. It keeps the caller's
+// values and cancellation but not the preparation deadline, which would cut
+// off go2tv's slow-renderer Play reply window.
+func (m *Manager) dlnaPlayContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if m.dlnaPlayStartTimeout <= 0 {
+		return m.operationContext(parent)
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), m.dlnaPlayStartTimeout)
+	if err := parent.Err(); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		cancel()
+		return ctx, cancel
+	}
+	stop := context.AfterFunc(parent, func() {
+		if !errors.Is(parent.Err(), context.DeadlineExceeded) {
+			cancel()
+		}
+	})
+	return ctx, func() {
+		stop()
+		cancel()
+	}
 }
 
 func (m *Manager) preparationContext(ctx context.Context, torrent *torrentPlayback) (context.Context, context.CancelFunc) {
@@ -447,8 +477,8 @@ func (m *Manager) playSession(ctx context.Context, sess *session) error {
 		if sess.dlnaPayload == nil {
 			return toolError("INTERNAL_ERROR", "dlna session is not configured")
 		}
-		if err := m.withRetry(ctx, func() error {
-			return sess.dlnaPayload.SendtoTV("Play")
+		if err := m.withRetryAwait(ctx, func() error {
+			return sess.dlnaPayload.SendtoTVContext(ctx, "Play")
 		}); err != nil {
 			return toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to resume DLNA playback: %v", err))
 		}
@@ -473,8 +503,8 @@ func (m *Manager) pauseSession(ctx context.Context, sess *session) error {
 		if sess.dlnaPayload == nil {
 			return toolError("INTERNAL_ERROR", "dlna session is not configured")
 		}
-		if err := m.withRetry(ctx, func() error {
-			return sess.dlnaPayload.SendtoTV("Pause")
+		if err := m.withRetryAwait(ctx, func() error {
+			return sess.dlnaPayload.SendtoTVContext(ctx, "Pause")
 		}); err != nil {
 			return toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to pause DLNA playback: %v", err))
 		}
@@ -569,8 +599,8 @@ func (m *Manager) SeekBeaming(ctx context.Context, req domain.SeekRequest) (*dom
 				return nil, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to seek DLNA transcoded playback: %v", err))
 			}
 		} else {
-			if err := m.withRetry(ctx, func() error {
-				return sess.dlnaPayload.SeekSoapCall(reltime)
+			if err := m.withRetryAwait(ctx, func() error {
+				return sess.dlnaPayload.SeekSoapCallContext(ctx, reltime)
 			}); err != nil {
 				return nil, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to seek DLNA playback: %v", err))
 			}
@@ -654,9 +684,9 @@ func (m *Manager) GetBeamingStatus(ctx context.Context, req domain.StatusRequest
 		}
 
 		var transport []string
-		if err := m.withRetry(ctx, func() error {
+		if err := m.withRetryAwait(ctx, func() error {
 			var err error
-			transport, err = sess.dlnaPayload.GetTransportInfo()
+			transport, err = sess.dlnaPayload.GetTransportInfoContext(ctx)
 			return err
 		}); err != nil {
 			return nil, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to query DLNA playback transport: %v", err))
@@ -666,9 +696,9 @@ func (m *Manager) GetBeamingStatus(ctx context.Context, req domain.StatusRequest
 		}
 
 		var positionInfo []string
-		positionErr := m.withRetry(ctx, func() error {
+		positionErr := m.withRetryAwait(ctx, func() error {
 			var err error
-			positionInfo, err = sess.dlnaPayload.GetPositionInfo()
+			positionInfo, err = sess.dlnaPayload.GetPositionInfoContext(ctx)
 			return err
 		})
 		if positionErr == nil {
@@ -1092,7 +1122,7 @@ func (m *Manager) runDLNAStateMonitor(ctx context.Context, sess *session) {
 		return
 	}
 
-	m.pollDLNAState(sess)
+	m.pollDLNAState(ctx, sess)
 
 	ticker := time.NewTicker(m.dlnaPollEvery)
 	defer ticker.Stop()
@@ -1111,27 +1141,32 @@ func (m *Manager) runDLNAStateMonitor(ctx context.Context, sess *session) {
 				sess.recordDLNAState(state, "", true, m.now())
 			}
 		case <-ticker.C:
-			m.pollDLNAState(sess)
+			m.pollDLNAState(ctx, sess)
 		}
 	}
 }
 
-func (m *Manager) pollDLNAState(sess *session) {
+// pollDLNAState queries under the monitor context, so shutdown aborts an
+// in-flight poll instead of waiting on an unresponsive renderer.
+func (m *Manager) pollDLNAState(ctx context.Context, sess *session) {
 	if sess == nil || sess.dlnaPayload == nil {
 		return
 	}
 
-	transport, err := sess.dlnaPayload.GetTransportInfo()
-	if err != nil {
+	transport, err := sess.dlnaPayload.GetTransportInfoContext(ctx)
+	if err != nil || ctx.Err() != nil {
 		return
 	}
 
 	state := normalizeDLNATransport(transport)
 	position := ""
 	if state == "playing" {
-		if p, pErr := sess.dlnaPayload.GetPositionInfo(); pErr == nil && len(p) >= 2 {
+		if p, pErr := sess.dlnaPayload.GetPositionInfoContext(ctx); pErr == nil && len(p) >= 2 {
 			position = strings.TrimSpace(p[1])
 		}
+	}
+	if ctx.Err() != nil {
+		return
 	}
 
 	sess.recordDLNAState(state, position, false, m.now())
@@ -1676,8 +1711,8 @@ func (m *Manager) sessionDurationSeconds(ctx context.Context, sess *session) (fl
 		}
 
 		var position []string
-		if err := m.withRetry(ctx, func() error {
-			p, err := sess.dlnaPayload.GetPositionInfo()
+		if err := m.withRetryAwait(ctx, func() error {
+			p, err := sess.dlnaPayload.GetPositionInfoContext(ctx)
 			if err != nil {
 				return err
 			}
@@ -1740,9 +1775,9 @@ func (m *Manager) sessionPositionSeconds(ctx context.Context, sess *session) (in
 		}
 
 		var positionInfo []string
-		if err := m.withRetry(ctx, func() error {
+		if err := m.withRetryAwait(ctx, func() error {
 			var err error
-			positionInfo, err = sess.dlnaPayload.GetPositionInfo()
+			positionInfo, err = sess.dlnaPayload.GetPositionInfoContext(ctx)
 			return err
 		}); err != nil {
 			return 0, 0, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to query DLNA playback position: %v", err))
@@ -2130,19 +2165,24 @@ func shutdownSessionWithReport(sess *session, stopMedia bool) sessionShutdownRep
 	return report
 }
 
+// stopDLNAPayload bounds Stop so an unreachable renderer cannot stall
+// shutdown. Upstream Stop releases every subscription and its renewal timers
+// before sending Stop; if unsubscribing fails it skips Stop, so send it bare.
 func stopDLNAPayload(payload adapters.DLNAPayload) (string, error) {
 	if payload == nil {
 		return "", nil
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), dlnaStopTimeout)
+	defer cancel()
 
-	err := payload.SendtoTV("Stop")
+	err := payload.SendtoTVContext(ctx, "Stop")
 	if err == nil {
 		return "", nil
 	}
 	if !isDLNAUnsubscribeError(err) {
 		return "", err
 	}
-	if stopErr := payload.StopPlayback(); stopErr != nil {
+	if stopErr := payload.StopPlaybackContext(ctx); stopErr != nil {
 		return "", fmt.Errorf("%v; fallback stop after unsubscribe cleanup failure: %w", err, stopErr)
 	}
 	return fmt.Sprintf("stop cleanup: %v", err), nil
