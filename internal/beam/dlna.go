@@ -2,6 +2,7 @@ package beam
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -41,7 +42,12 @@ func (m *Manager) ensureSubtitleFFmpeg(subtitlePath string, embeddedTrack *int, 
 	return "", nil
 }
 
+// prepareDLNAFilePlayback bounds only its preparation steps with the
+// preparation deadline. ctx is the caller's context, passed on unchanged so
+// the playback phases get their own budgets.
 func (m *Manager) prepareDLNAFilePlayback(ctx context.Context, req domain.BeamRequest, device *domain.Device, mode string, torrent *torrentPlayback) (*preparedDLNA, error) {
+	prepareCtx, cancelPrepare := m.preparationContext(ctx, torrent)
+	defer cancelPrepare()
 	source := req.Source
 	mediaType := ""
 	var err error
@@ -79,7 +85,7 @@ func (m *Manager) prepareDLNAFilePlayback(ctx context.Context, req domain.BeamRe
 	if err != nil {
 		return nil, err
 	}
-	captions, err := m.prepareDLNALocalSubtitles(ctx, source, subtitlesPath, ffmpegPath, transcoding, req.SubtitleMode, track, startSeconds(req.StartSeconds))
+	captions, err := m.prepareDLNALocalSubtitles(prepareCtx, source, subtitlesPath, ffmpegPath, transcoding, req.SubtitleMode, track, startSeconds(req.StartSeconds))
 	if err != nil {
 		captions.closeTemporarySource()
 		return nil, err
@@ -87,7 +93,7 @@ func (m *Manager) prepareDLNAFilePlayback(ctx context.Context, req domain.BeamRe
 	options := dlnaPlaybackOptions{captions: captions}
 	duration := float64(0)
 	if transcoding {
-		duration, err = m.optionalMediaDuration(ctx, ffmpegPath, source)
+		duration, err = m.optionalMediaDuration(prepareCtx, ffmpegPath, source)
 		if err != nil {
 			captions.closeTemporarySource()
 			return nil, err
@@ -115,7 +121,11 @@ func (m *Manager) prepareDLNAFilePlayback(ctx context.Context, req domain.BeamRe
 	return prepared, nil
 }
 
+// prepareDLNAURLPlayback follows the same context split as
+// prepareDLNAFilePlayback.
 func (m *Manager) prepareDLNAURLPlayback(ctx context.Context, req domain.BeamRequest, device *domain.Device, mode string) (*preparedDLNA, error) {
+	prepareCtx, cancelPrepare := m.preparationContext(ctx, nil)
+	defer cancelPrepare()
 	sourceURL := strings.TrimSpace(req.Source)
 	if _, err := m.validateSourceURLPolicy(sourceURL); err != nil {
 		return nil, err
@@ -131,10 +141,10 @@ func (m *Manager) prepareDLNAURLPlayback(ctx context.Context, req domain.BeamReq
 			return nil, err
 		}
 	}
-	_, mediaType, mediaCloser, err := m.prepareRetainedURLMedia(ctx, sourceURL)
+	_, mediaType, mediaCloser, err := m.prepareRetainedURLMedia(prepareCtx, sourceURL)
 	if err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
+		if prepareCtx.Err() != nil {
+			return nil, prepareCtx.Err()
 		}
 		return nil, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to stream source URL: %v", err))
 	}
@@ -159,14 +169,14 @@ func (m *Manager) prepareDLNAURLPlayback(ctx context.Context, req domain.BeamReq
 	if err != nil {
 		return nil, err
 	}
-	captions, err := m.prepareDLNALocalSubtitles(ctx, "", subtitlesPath, ffmpegPath, transcoding, req.SubtitleMode, nil, startSeconds(req.StartSeconds))
+	captions, err := m.prepareDLNALocalSubtitles(prepareCtx, "", subtitlesPath, ffmpegPath, transcoding, req.SubtitleMode, nil, startSeconds(req.StartSeconds))
 	if err != nil {
 		captions.closeTemporarySource()
 		return nil, err
 	}
 	duration := float64(0)
 	if transcoding {
-		duration, err = optionalURLMediaDuration(ctx, ffmpegPath, sourceURL)
+		duration, err = optionalURLMediaDuration(prepareCtx, ffmpegPath, sourceURL)
 		if err != nil {
 			captions.closeTemporarySource()
 			return nil, err
@@ -187,10 +197,27 @@ func (m *Manager) prepareDLNAURLPlayback(ctx context.Context, req domain.BeamReq
 	return prepared, nil
 }
 
+// startDLNAServerAndPlay takes the caller's context. Startup, Play1 and the
+// start seek each derive their own deadline from it, so a slow phase cannot
+// spend the next one's budget.
 func (m *Manager) startDLNAServerAndPlay(ctx context.Context, device *domain.Device, media any, mediaType, mediaPath string, transcoding bool, ffmpegPath string, startAtSeconds int, options dlnaPlaybackOptions) (*preparedDLNA, error) {
 	startupCtx, cancel := m.operationContext(ctx)
 	defer cancel()
-	payload, err := m.newDLNAPayload(startupCtx, device, mediaPath, mediaType, transcoding, ffmpegPath, startAtSeconds, options)
+	// The payload context lives as long as the session: go2tv's subscription
+	// renewal timers read it, and they can fire during a slow Play.
+	payloadCtx, cancelPayloadCtx := context.WithCancel(context.Background())
+	var proxyCloser io.Closer
+	transferred := false
+	defer func() {
+		if transferred {
+			return
+		}
+		cancelPayloadCtx()
+		if proxyCloser != nil {
+			_ = proxyCloser.Close()
+		}
+	}()
+	payload, err := m.newDLNAPayload(startupCtx, payloadCtx, device, mediaPath, mediaType, transcoding, ffmpegPath, startAtSeconds, options)
 	if err != nil {
 		return nil, err
 	}
@@ -199,13 +226,6 @@ func (m *Manager) startDLNAServerAndPlay(ctx context.Context, device *domain.Dev
 	if raw == nil {
 		return nil, toolError("INTERNAL_ERROR", "DLNA payload details are unavailable")
 	}
-	var proxyCloser io.Closer
-	transferred := false
-	defer func() {
-		if !transferred && proxyCloser != nil {
-			_ = proxyCloser.Close()
-		}
-	}()
 	if sourceURL, ok := media.(string); ok {
 		if parsed, parseErr := url.Parse(sourceURL); parseErr == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") {
 			if transcoding {
@@ -239,13 +259,19 @@ func (m *Manager) startDLNAServerAndPlay(ctx context.Context, device *domain.Dev
 		server.StopServer()
 		return nil, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to start DLNA media server: %v", err))
 	}
-	// Play1 gets its own budget: go2tv waits up to 45s for a slow Play reply and
-	// then confirms through GetTransportInfo, which the shorter preparation
-	// deadline would cut off.
-	playCtx, cancelPlay := m.dlnaPlayContext(ctx)
-	defer cancelPlay()
-	if err := m.withRetryAwait(playCtx, func() error { return payload.SendtoTVContext(playCtx, "Play1") }); err != nil {
+	// abort stops the renderer before its media server, so the renderer does
+	// not keep requesting a stream that is gone. Stop also releases go2tv's
+	// subscriptions and their renewal timers.
+	abort := func() {
+		_, _ = stopDLNAPayload(payload)
 		server.StopServer()
+	}
+	if err := m.startDLNARendererPlayback(ctx, payload); err != nil {
+		if dlnaPlayReachedRenderer(err) {
+			abort()
+		} else {
+			server.StopServer()
+		}
 		return nil, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to start DLNA playback: %v", err))
 	}
 	if !transcoding && startAtSeconds > 0 {
@@ -253,23 +279,82 @@ func (m *Manager) startDLNAServerAndPlay(ctx context.Context, device *domain.Dev
 		seekCtx, cancelSeek := m.operationContext(ctx)
 		defer cancelSeek()
 		if err := m.withRetryAwait(seekCtx, func() error { return payload.SeekSoapCallContext(seekCtx, reltime) }); err != nil {
-			server.StopServer()
-			// The payload context may already have expired with startup;
-			// stop with a fresh bounded context so playback does not linger.
-			_, _ = stopDLNAPayload(payload)
+			abort()
 			return nil, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to seek DLNA playback start position: %v", err))
 		}
 	}
 	transferred = true
-	return &preparedDLNA{mediaURL: payload.MediaURL(), transcoding: transcoding, warnings: options.captions.warnings, httpServer: server, payload: payload, callbackCh: callbackStateCh, sourceCloser: combineClosers(options.captions.closer, proxyCloser)}, nil
+	return &preparedDLNA{mediaURL: payload.MediaURL(), transcoding: transcoding, warnings: options.captions.warnings, httpServer: server, payload: payload, payloadCtx: payloadCtx, payloadCancel: cancelPayloadCtx, callbackCh: callbackStateCh, sourceCloser: combineClosers(options.captions.closer, proxyCloser)}, nil
 }
 
-func (m *Manager) newDLNAPayload(ctx context.Context, device *domain.Device, mediaPath, mediaType string, transcoding bool, ffmpegPath string, startAtSeconds int, options dlnaPlaybackOptions) (adapters.DLNAPayload, error) {
+// startDLNARendererPlayback sends go2tv's Play1 (protocol info, subscribe,
+// SetAVTransportURI, then Play) under its own budget. go2tv waits up to 45s for
+// a slow Play reply, which the preparation deadline would cut off.
+func (m *Manager) startDLNARendererPlayback(ctx context.Context, payload adapters.DLNAPayload) error {
+	playCtx, cancelPlay := m.dlnaPlayContext(ctx)
+	defer cancelPlay()
+	// Play1 is not idempotent: a retry subscribes again and reloads the URI.
+	// Retry refused or reset connections, but never a reply that timed out
+	// while the renderer may still be probing the media.
+	err := m.withRetryAwaitIf(playCtx, func() error { return payload.SendtoTVContext(playCtx, "Play1") }, isRetryableDLNAPlayError)
+	if err == nil {
+		return nil
+	}
+	// When the Play budget itself runs out, go2tv's "started anyway" check
+	// runs on the expired context and cannot succeed. Repeat it with a fresh
+	// bounded context while the caller is still waiting.
+	if ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+		checkCtx, cancelCheck := m.operationContext(ctx)
+		defer cancelCheck()
+		if dlnaRendererStarted(checkCtx, payload) {
+			return nil
+		}
+	}
+	return err
+}
+
+// dlnaRendererStarted mirrors go2tv's Play timeout recovery: PLAYING or
+// TRANSITIONING means the renderer acted on Play without answering in time.
+func dlnaRendererStarted(ctx context.Context, payload adapters.DLNAPayload) bool {
+	info, err := payload.GetTransportInfoContext(ctx)
+	if err != nil || len(info) == 0 {
+		return false
+	}
+	switch info[0] {
+	case "PLAYING", "TRANSITIONING":
+		return true
+	}
+	return false
+}
+
+func isRetryableDLNAPlayError(err error) bool {
+	return isTransientNetworkError(err) && !isTimeoutError(err)
+}
+
+func isTimeoutError(err error) bool {
+	var timeout interface{ Timeout() bool }
+	if errors.As(err, &timeout) && timeout.Timeout() {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "timeout")
+}
+
+// dlnaPlayReachedRenderer reports whether a failed Play1 may have left state
+// on the renderer. go2tv's first step, GetProtocolInfo, changes nothing, so
+// a failure there needs no Stop. Any later failure might have registered
+// subscriptions or loaded the URI.
+func dlnaPlayReachedRenderer(err error) bool {
+	return !strings.Contains(strings.ToLower(err.Error()), "getprotocolinfo call error")
+}
+
+// newDLNAPayload creates the payload under startupCtx, which bounds go2tv's
+// device description fetch, then binds it to payloadCtx for the session.
+func (m *Manager) newDLNAPayload(startupCtx, payloadCtx context.Context, device *domain.Device, mediaPath, mediaType string, transcoding bool, ffmpegPath string, startAtSeconds int, options dlnaPlaybackOptions) (adapters.DLNAPayload, error) {
 	if strings.TrimSpace(mediaPath) == "" {
 		return nil, toolError("UNSUPPORTED_MEDIA", "source is empty")
 	}
 	payload, err := m.dlnaFactory.NewTVPayload(&soapcalls.Options{
-		Ctx: ctx, DMR: device.Address, Media: mediaPath, Mtype: mediaType,
+		Ctx: startupCtx, DMR: device.Address, Media: mediaPath, Mtype: mediaType,
 		Transcode: transcoding, Seek: !transcoding, FFmpegPath: ffmpegPath,
 		FFmpegSubsPath: options.captions.burnPath, FFmpegEmbeddedSubtitle: options.captions.embedded,
 		FFmpegSeek: startAtSeconds, TorrentSource: options.torrentSource,
@@ -277,7 +362,7 @@ func (m *Manager) newDLNAPayload(ctx context.Context, device *domain.Device, med
 	if err != nil {
 		return nil, toolError("PROTOCOL_ERROR", fmt.Sprintf("failed to initialize DLNA payload: %v", err))
 	}
-	payload.SetContext(ctx)
+	payload.SetContext(payloadCtx)
 	return payload, nil
 }
 

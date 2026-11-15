@@ -41,7 +41,6 @@ const (
 
 	dlnaPollInterval      = 4 * time.Second
 	dlnaMonitorStopWait   = 500 * time.Millisecond
-	dlnaStopTimeout       = 10 * time.Second
 	dlnaCallbackQueueSize = 16
 
 	defaultIdleCleanupAfter   = 10 * time.Minute
@@ -219,6 +218,8 @@ type preparedDLNA struct {
 	httpServer    streamServer
 	sourceCloser  io.Closer
 	payload       adapters.DLNAPayload
+	payloadCtx    context.Context
+	payloadCancel context.CancelFunc
 	callbackCh    <-chan string
 	mediaDuration float64
 	dlnaSeekPlan  *dlnaSubtitleSeek
@@ -353,27 +354,14 @@ func (m *Manager) operationContext(ctx context.Context) (context.Context, contex
 	return context.WithCancel(ctx)
 }
 
-// dlnaPlayContext gives a DLNA Play1 its own budget. It keeps the caller's
-// values and cancellation but not the preparation deadline, which would cut
-// off go2tv's slow-renderer Play reply window.
+// dlnaPlayContext gives a DLNA Play1 its own budget. parent must be the
+// caller's context, not the preparation context, so the caller's
+// cancellation and deadline apply while the preparation deadline does not.
 func (m *Manager) dlnaPlayContext(parent context.Context) (context.Context, context.CancelFunc) {
 	if m.dlnaPlayStartTimeout <= 0 {
 		return m.operationContext(parent)
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), m.dlnaPlayStartTimeout)
-	if err := parent.Err(); err != nil && !errors.Is(err, context.DeadlineExceeded) {
-		cancel()
-		return ctx, cancel
-	}
-	stop := context.AfterFunc(parent, func() {
-		if !errors.Is(parent.Err(), context.DeadlineExceeded) {
-			cancel()
-		}
-	})
-	return ctx, func() {
-		stop()
-		cancel()
-	}
+	return context.WithTimeout(parent, m.dlnaPlayStartTimeout)
 }
 
 func (m *Manager) preparationContext(ctx context.Context, torrent *torrentPlayback) (context.Context, context.CancelFunc) {
@@ -983,21 +971,21 @@ func (m *Manager) beamDLNA(ctx context.Context, req domain.BeamRequest, device *
 		isURL = true
 	}
 
+	// The prepare functions apply the preparation deadline themselves; the
+	// playback phases need the caller's context without it.
 	var prepared *preparedDLNA
 	var err error
-	prepareCtx, cancelPrepare := m.preparationContext(ctx, torrent)
-	defer cancelPrepare()
 	if isURL {
-		prepared, err = m.prepareDLNAURLPlayback(prepareCtx, req, device, mode)
+		prepared, err = m.prepareDLNAURLPlayback(ctx, req, device, mode)
 	} else {
-		prepared, err = m.prepareDLNAFilePlayback(prepareCtx, req, device, mode, torrent)
+		prepared, err = m.prepareDLNAFilePlayback(ctx, req, device, mode, torrent)
 	}
 	if err != nil {
 		return nil, err
 	}
 
-	monitorCtx, monitorCancel := context.WithCancel(context.Background())
-	prepared.payload.SetContext(monitorCtx)
+	// The payload is already bound to this session-lifetime context.
+	monitorCtx, monitorCancel := prepared.payloadCtx, prepared.payloadCancel
 	sess := &session{
 		ID:            newSessionID(),
 		DeviceID:      device.ID,
@@ -1291,13 +1279,19 @@ func (m *Manager) withRetry(ctx context.Context, call func() error) error {
 }
 
 func (m *Manager) withRetryRunner(ctx context.Context, call func() error) error {
-	return m.withRetryUsing(ctx, call, runCallWithContext)
+	return m.withRetryUsing(ctx, call, isTransientNetworkError, runCallWithContext)
 }
 
 // withRetryAwait waits for context-aware operations to finish before returning,
 // so cancellation cannot leave control work running after releasing session locks.
 func (m *Manager) withRetryAwait(ctx context.Context, call func() error) error {
-	return m.withRetryUsing(ctx, call, func(ctx context.Context, call func() error) error {
+	return m.withRetryAwaitIf(ctx, call, isTransientNetworkError)
+}
+
+// withRetryAwaitIf is withRetryAwait with a caller-chosen retry predicate,
+// for calls that are unsafe to repeat after some transient errors.
+func (m *Manager) withRetryAwaitIf(ctx context.Context, call func() error, retryable func(error) bool) error {
+	return m.withRetryUsing(ctx, call, retryable, func(ctx context.Context, call func() error) error {
 		if ctx != nil && ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -1309,7 +1303,7 @@ func (m *Manager) withRetryAwait(ctx context.Context, call func() error) error {
 	})
 }
 
-func (m *Manager) withRetryUsing(ctx context.Context, call func() error, run func(context.Context, func() error) error) error {
+func (m *Manager) withRetryUsing(ctx context.Context, call func() error, retryable func(error) bool, run func(context.Context, func() error) error) error {
 	if call == nil {
 		return errors.New("retry call is nil")
 	}
@@ -1337,7 +1331,7 @@ func (m *Manager) withRetryUsing(ctx context.Context, call func() error, run fun
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return err
 		}
-		if attempt >= attempts || !isTransientNetworkError(err) {
+		if attempt >= attempts || !retryable(err) {
 			break
 		}
 
@@ -2165,6 +2159,10 @@ func shutdownSessionWithReport(sess *session, stopMedia bool) sessionShutdownRep
 	return report
 }
 
+// dlnaStopTimeout bounds each renderer stop step. It is a variable so tests
+// can shorten it.
+var dlnaStopTimeout = 10 * time.Second
+
 // stopDLNAPayload bounds Stop so an unreachable renderer cannot stall
 // shutdown. Upstream Stop releases every subscription and its renewal timers
 // before sending Stop; if unsubscribing fails it skips Stop, so send it bare.
@@ -2173,16 +2171,19 @@ func stopDLNAPayload(payload adapters.DLNAPayload) (string, error) {
 		return "", nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), dlnaStopTimeout)
-	defer cancel()
-
 	err := payload.SendtoTVContext(ctx, "Stop")
+	cancel()
 	if err == nil {
 		return "", nil
 	}
 	if !isDLNAUnsubscribeError(err) {
 		return "", err
 	}
-	if stopErr := payload.StopPlaybackContext(ctx); stopErr != nil {
+	// Unsubscribing can use the whole first budget, so the bare Stop gets
+	// its own.
+	stopCtx, cancelStop := context.WithTimeout(context.Background(), dlnaStopTimeout)
+	defer cancelStop()
+	if stopErr := payload.StopPlaybackContext(stopCtx); stopErr != nil {
 		return "", fmt.Errorf("%v; fallback stop after unsubscribe cleanup failure: %w", err, stopErr)
 	}
 	return fmt.Sprintf("stop cleanup: %v", err), nil

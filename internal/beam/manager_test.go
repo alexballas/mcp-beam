@@ -349,12 +349,20 @@ type fakeDLNAPayload struct {
 	playDelay                      time.Duration
 	blockTransportUntilContextDone bool
 	failStopIfContextDone          bool
+	blockStopUntilContextDone      bool
+
+	// payloadCtxErrAtPlay records the payload context's error when a slow
+	// Play1 finishes, to catch subscription renewals running on a dead context.
+	payloadCtxErrAtPlay error
+	playFinished        bool
+	stopPlaybackCtxErr  error
 }
 
 func (f *fakeDLNAPayload) SendtoTVContext(ctx context.Context, action string) error {
 	f.mu.Lock()
 	f.actions = append(f.actions, action)
 	block := f.blockPlayUntilContextDone && action == "Play1"
+	blockStop := f.blockStopUntilContextDone && action == "Stop"
 	delay := time.Duration(0)
 	if action == "Play1" {
 		delay = f.playDelay
@@ -370,6 +378,17 @@ func (f *fakeDLNAPayload) SendtoTVContext(ctx context.Context, action string) er
 			return ctx.Err()
 		case <-timer.C:
 		}
+		f.mu.Lock()
+		f.playFinished = true
+		if f.ctx != nil {
+			f.payloadCtxErrAtPlay = f.ctx.Err()
+		}
+		f.mu.Unlock()
+	}
+
+	if blockStop {
+		<-ctx.Done()
+		return fmt.Errorf("SendtoTV unsubscribe call error: %w", ctx.Err())
 	}
 
 	if block {
@@ -395,10 +414,14 @@ func (f *fakeDLNAPayload) SendtoTVContext(ctx context.Context, action string) er
 	return nil
 }
 
-func (f *fakeDLNAPayload) StopPlaybackContext(context.Context) error {
+func (f *fakeDLNAPayload) StopPlaybackContext(ctx context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.stopPlaybackCalls++
+	f.stopPlaybackCtxErr = ctx.Err()
+	if f.stopPlaybackCtxErr != nil {
+		return f.stopPlaybackCtxErr
+	}
 	return f.stopPlaybackErr
 }
 
@@ -2284,6 +2307,7 @@ func TestBeamMediaDLNAOperationTimeout(t *testing.T) {
 	payload := &fakeDLNAPayload{
 		listenAddr:                "127.0.0.1:3563",
 		blockPlayUntilContextDone: true,
+		transportResponses:        [][]string{{"STOPPED", "OK", "1"}},
 	}
 	manager := NewManager(&fakeDiscovery{devices: []domain.Device{{
 		ID:       "dlna_timeout",
@@ -2319,6 +2343,9 @@ func TestBeamMediaDLNAOperationTimeout(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(toolErr.Message), "context deadline exceeded") {
 		t.Fatalf("expected context deadline message, got %q", toolErr.Message)
+	}
+	if payload.actionCount("Stop") != 1 {
+		t.Fatalf("expected renderer Stop after Play1 ran out of time, got %d", payload.actionCount("Stop"))
 	}
 }
 
@@ -2379,6 +2406,221 @@ func TestBeamMediaDLNAPlayHonorsCallerCancellation(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "context canceled") {
 		t.Fatalf("expected context canceled, got %v", err)
+	}
+}
+
+func TestBeamMediaDLNASlowPlayThenStartSeek(t *testing.T) {
+	payload := &fakeDLNAPayload{listenAddr: "127.0.0.1:3580", playDelay: 150 * time.Millisecond}
+	manager, mediaPath := newDLNAPlayTestManager(t, payload, "dlna_slow_seek")
+	manager.beamOperationTimeout = 40 * time.Millisecond
+	manager.dlnaPlayStartTimeout = 2 * time.Second
+	start := 30
+
+	if _, err := manager.BeamMedia(context.Background(), domain.BeamRequest{
+		Source:       mediaPath,
+		TargetDevice: "dlna_slow_seek",
+		Transcode:    "never",
+		StartSeconds: &start,
+	}); err != nil {
+		t.Fatalf("expected start seek after a slow Play to get its own budget: %v", err)
+	}
+	payload.mu.Lock()
+	defer payload.mu.Unlock()
+	if payload.seekRelTime != "00:00:30" {
+		t.Fatalf("expected start seek to 00:00:30, got %q", payload.seekRelTime)
+	}
+}
+
+func TestBeamMediaDLNAPlayHonorsLateCallerCancellation(t *testing.T) {
+	payload := &fakeDLNAPayload{listenAddr: "127.0.0.1:3581", blockPlayUntilContextDone: true}
+	manager, mediaPath := newDLNAPlayTestManager(t, payload, "dlna_late_cancel")
+	// Cancel well after the preparation deadline has passed.
+	manager.beamOperationTimeout = 40 * time.Millisecond
+	manager.dlnaPlayStartTimeout = 10 * time.Second
+
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(200*time.Millisecond, cancel)
+	started := time.Now()
+	_, err := manager.BeamMedia(ctx, domain.BeamRequest{
+		Source:       mediaPath,
+		TargetDevice: "dlna_late_cancel",
+		Transcode:    "never",
+	})
+	if err == nil {
+		t.Fatal("expected cancellation error")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("expected late cancellation to abort Play, elapsed=%s", elapsed)
+	}
+	if !strings.Contains(err.Error(), "context canceled") {
+		t.Fatalf("expected context canceled, got %v", err)
+	}
+}
+
+func TestBeamMediaDLNAPlayHonorsCallerDeadline(t *testing.T) {
+	payload := &fakeDLNAPayload{listenAddr: "127.0.0.1:3582", blockPlayUntilContextDone: true}
+	manager, mediaPath := newDLNAPlayTestManager(t, payload, "dlna_caller_deadline")
+	manager.beamOperationTimeout = 40 * time.Millisecond
+	manager.dlnaPlayStartTimeout = 10 * time.Second
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := manager.BeamMedia(ctx, domain.BeamRequest{
+		Source:       mediaPath,
+		TargetDevice: "dlna_caller_deadline",
+		Transcode:    "never",
+	})
+	if err == nil {
+		t.Fatal("expected caller deadline error")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("expected caller deadline to bound Play, elapsed=%s", elapsed)
+	}
+}
+
+func TestBeamMediaDLNAPlayFailureStopsRenderer(t *testing.T) {
+	payload := &fakeDLNAPayload{
+		listenAddr: "127.0.0.1:3583",
+		actionErr:  map[string]error{"Play1": errors.New("SendtoTV Play/Stop/Pause action error: rejected")},
+	}
+	manager, mediaPath := newDLNAPlayTestManager(t, payload, "dlna_play_fail")
+
+	if _, err := manager.BeamMedia(context.Background(), domain.BeamRequest{
+		Source:       mediaPath,
+		TargetDevice: "dlna_play_fail",
+		Transcode:    "never",
+	}); err == nil {
+		t.Fatal("expected Play1 failure")
+	}
+	if payload.actionCount("Stop") != 1 {
+		t.Fatalf("expected renderer Stop after failed Play1, got %d", payload.actionCount("Stop"))
+	}
+}
+
+func TestBeamMediaDLNAProtocolInfoFailureSkipsRendererStop(t *testing.T) {
+	payload := &fakeDLNAPayload{
+		listenAddr: "127.0.0.1:3584",
+		actionErr:  map[string]error{"Play1": errors.New("SendtoTV getProtocolInfo call error: bad response")},
+	}
+	manager, mediaPath := newDLNAPlayTestManager(t, payload, "dlna_protocol_fail")
+
+	if _, err := manager.BeamMedia(context.Background(), domain.BeamRequest{
+		Source:       mediaPath,
+		TargetDevice: "dlna_protocol_fail",
+		Transcode:    "never",
+	}); err == nil {
+		t.Fatal("expected Play1 failure")
+	}
+	if payload.actionCount("Stop") != 0 {
+		t.Fatalf("expected no renderer Stop when Play1 failed before changing renderer state, got %d", payload.actionCount("Stop"))
+	}
+}
+
+func TestBeamMediaDLNAPlayReplyTimeoutIsNotRetried(t *testing.T) {
+	payload := &fakeDLNAPayload{
+		listenAddr: "127.0.0.1:3585",
+		actionErr:  map[string]error{"Play1": errors.New("SendtoTV Play/Stop/Pause action error: Post: i/o timeout")},
+	}
+	manager, mediaPath := newDLNAPlayTestManager(t, payload, "dlna_play_reply_timeout")
+
+	if _, err := manager.BeamMedia(context.Background(), domain.BeamRequest{
+		Source:       mediaPath,
+		TargetDevice: "dlna_play_reply_timeout",
+		Transcode:    "never",
+	}); err == nil {
+		t.Fatal("expected Play1 failure")
+	}
+	if got := payload.actionCount("Play1"); got != 1 {
+		t.Fatalf("expected a timed-out Play1 not to be retried, got %d attempts", got)
+	}
+}
+
+func TestBeamMediaDLNAPlayRetriesRefusedConnection(t *testing.T) {
+	payload := &fakeDLNAPayload{
+		listenAddr: "127.0.0.1:3586",
+		actionErr:  map[string]error{"Play1": errors.New("SendtoTV subscribe call error: connection refused")},
+	}
+	manager, mediaPath := newDLNAPlayTestManager(t, payload, "dlna_play_refused")
+	manager.retryBaseBackoff = time.Millisecond
+	manager.retryMaxBackoff = time.Millisecond
+
+	if _, err := manager.BeamMedia(context.Background(), domain.BeamRequest{
+		Source:       mediaPath,
+		TargetDevice: "dlna_play_refused",
+		Transcode:    "never",
+	}); err == nil {
+		t.Fatal("expected Play1 failure")
+	}
+	if got := payload.actionCount("Play1"); got != manager.retryAttempts {
+		t.Fatalf("expected refused Play1 to be retried %d times, got %d", manager.retryAttempts, got)
+	}
+}
+
+func TestBeamMediaDLNAPlayBudgetExpiredButRendererStarted(t *testing.T) {
+	payload := &fakeDLNAPayload{
+		listenAddr:                "127.0.0.1:3587",
+		blockPlayUntilContextDone: true,
+		transportResponses:        [][]string{{"TRANSITIONING", "OK", "1"}},
+	}
+	manager, mediaPath := newDLNAPlayTestManager(t, payload, "dlna_play_started_late")
+	manager.dlnaPlayStartTimeout = 40 * time.Millisecond
+
+	if _, err := manager.BeamMedia(context.Background(), domain.BeamRequest{
+		Source:       mediaPath,
+		TargetDevice: "dlna_play_started_late",
+		Transcode:    "never",
+	}); err != nil {
+		t.Fatalf("expected a renderer that started after the Play budget to count as started: %v", err)
+	}
+	if payload.actionCount("Stop") != 0 {
+		t.Fatalf("expected no Stop for a renderer that started, got %d", payload.actionCount("Stop"))
+	}
+}
+
+func TestBeamMediaDLNAPayloadContextOutlivesStartupDuringSlowPlay(t *testing.T) {
+	payload := &fakeDLNAPayload{listenAddr: "127.0.0.1:3588", playDelay: 150 * time.Millisecond}
+	manager, mediaPath := newDLNAPlayTestManager(t, payload, "dlna_payload_ctx")
+	manager.beamOperationTimeout = 40 * time.Millisecond
+	manager.dlnaPlayStartTimeout = 2 * time.Second
+
+	if _, err := manager.BeamMedia(context.Background(), domain.BeamRequest{
+		Source:       mediaPath,
+		TargetDevice: "dlna_payload_ctx",
+		Transcode:    "never",
+	}); err != nil {
+		t.Fatalf("beam media: %v", err)
+	}
+	payload.mu.Lock()
+	defer payload.mu.Unlock()
+	if !payload.playFinished {
+		t.Fatal("expected slow Play1 to finish")
+	}
+	if payload.payloadCtxErrAtPlay != nil {
+		t.Fatalf("expected payload context to stay live through a slow Play, got %v", payload.payloadCtxErrAtPlay)
+	}
+}
+
+func TestStopDLNAPayloadFallbackGetsFreshBudget(t *testing.T) {
+	previous := dlnaStopTimeout
+	dlnaStopTimeout = 40 * time.Millisecond
+	t.Cleanup(func() { dlnaStopTimeout = previous })
+	payload := &fakeDLNAPayload{blockStopUntilContextDone: true}
+
+	warning, err := stopDLNAPayload(payload)
+	if err != nil {
+		t.Fatalf("expected fallback Stop to succeed after unsubscribe used its budget: %v", err)
+	}
+	if !strings.Contains(warning, "unsubscribe") {
+		t.Fatalf("expected unsubscribe cleanup warning, got %q", warning)
+	}
+	payload.mu.Lock()
+	defer payload.mu.Unlock()
+	if payload.stopPlaybackCalls != 1 {
+		t.Fatalf("expected one fallback Stop, got %d", payload.stopPlaybackCalls)
+	}
+	if payload.stopPlaybackCtxErr != nil {
+		t.Fatalf("expected fallback Stop to run on a live context, got %v", payload.stopPlaybackCtxErr)
 	}
 }
 
@@ -2457,8 +2699,8 @@ func TestBeamMediaDLNARebindsPayloadContextForSessionLifecycle(t *testing.T) {
 
 	payload.mu.Lock()
 	defer payload.mu.Unlock()
-	if payload.setContextCalls < 2 {
-		t.Fatalf("expected payload context to be rebound for session lifecycle, got %d setContext calls", payload.setContextCalls)
+	if payload.setContextCalls < 1 {
+		t.Fatal("expected payload context to be bound for the session lifecycle")
 	}
 	if payload.ctx == nil {
 		t.Fatal("expected payload context to be set")
