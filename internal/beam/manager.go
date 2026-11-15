@@ -934,6 +934,12 @@ func (m *Manager) waitForChromecastPlaybackStart(ctx context.Context, client ada
 	for {
 		select {
 		case err := <-loadResultCh:
+			// During the grace window, only the load watcher's grace timer
+			// cancels the load, at the same moment graceC fires. Report that
+			// as the deadline it is, whichever channel the select saw first.
+			if graceC != nil && errors.Is(err, context.Canceled) {
+				return context.DeadlineExceeded
+			}
 			return err
 		case <-ticker.C:
 			status, err := client.GetStatus()
