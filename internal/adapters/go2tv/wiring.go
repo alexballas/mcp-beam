@@ -34,6 +34,10 @@ func (DiscoveryAdapter) LoadAllDevices() ([]devices.Device, error) {
 	return devices.LoadAllDevices()
 }
 
+func (DiscoveryAdapter) RefreshDiscovery(ctx context.Context) error {
+	return devices.RefreshDiscovery(ctx)
+}
+
 type CastFactory struct{}
 
 func (CastFactory) NewCastClient(deviceAddr string) (adapters.CastClient, error) {
@@ -104,28 +108,30 @@ type DLNAPayloadAdapter struct {
 	payload *soapcalls.TVPayload
 }
 
-func (d *DLNAPayloadAdapter) SendtoTV(action string) error {
-	return d.payload.SendtoTV(action)
-}
-
 func (d *DLNAPayloadAdapter) SendtoTVContext(ctx context.Context, action string) error {
 	return d.payload.SendtoTVContext(ctx, action)
 }
 
-func (d *DLNAPayloadAdapter) StopPlayback() error {
-	return d.payload.PlayPauseStopSoapCall("Stop")
+// StopPlaybackContext sends a bare AVTransport Stop without subscription cleanup.
+func (d *DLNAPayloadAdapter) StopPlaybackContext(ctx context.Context) error {
+	return d.payload.PlayPauseStopSoapCallContext(ctx, "Stop")
 }
 
-func (d *DLNAPayloadAdapter) SeekSoapCall(reltime string) error {
-	return d.payload.SeekSoapCall(reltime)
+func (d *DLNAPayloadAdapter) SeekSoapCallContext(ctx context.Context, reltime string) error {
+	return d.payload.SeekSoapCallContext(ctx, reltime)
 }
 
-func (d *DLNAPayloadAdapter) GetTransportInfo() ([]string, error) {
-	return d.payload.GetTransportInfo()
+func (d *DLNAPayloadAdapter) GetTransportInfoContext(ctx context.Context) ([]string, error) {
+	return d.payload.GetTransportInfoContext(ctx)
 }
 
-func (d *DLNAPayloadAdapter) GetPositionInfo() ([]string, error) {
-	return d.payload.GetPositionInfo()
+// GetPositionInfoContext returns {TrackDuration, RelTime}, matching GetPositionInfo.
+func (d *DLNAPayloadAdapter) GetPositionInfoContext(ctx context.Context) ([]string, error) {
+	info, err := d.payload.GetPositionInfoContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return []string{info.TrackDuration, info.RelTime}, nil
 }
 
 func (d *DLNAPayloadAdapter) ListenAddress() string {

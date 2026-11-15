@@ -12,6 +12,9 @@ import (
 type Discovery interface {
 	StartDiscovery(ctx context.Context)
 	LoadAllDevices() ([]devices.Device, error)
+	// RefreshDiscovery waits for the running discovery loops to finish their
+	// next DLNA and Chromecast scans, so the cache reflects both protocols.
+	RefreshDiscovery(ctx context.Context) error
 }
 
 // CastClient represents a controllable Chromecast session.
@@ -35,12 +38,13 @@ type CastFactory interface {
 
 // DLNAPayload represents a DLNA control channel.
 type DLNAPayload interface {
-	SendtoTV(action string) error
+	// Control and query calls take a context so cancellation aborts the
+	// renderer request itself instead of abandoning it in the background.
 	SendtoTVContext(context.Context, string) error
-	StopPlayback() error
-	SeekSoapCall(reltime string) error
-	GetTransportInfo() ([]string, error)
-	GetPositionInfo() ([]string, error)
+	StopPlaybackContext(context.Context) error
+	SeekSoapCallContext(ctx context.Context, reltime string) error
+	GetTransportInfoContext(context.Context) ([]string, error)
+	GetPositionInfoContext(context.Context) ([]string, error)
 	ListenAddress() string
 	SetContext(ctx context.Context)
 	MediaURL() string
