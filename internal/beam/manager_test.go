@@ -29,6 +29,16 @@ type fakeDiscovery struct {
 	includeCalls  []bool
 	devicesByCall [][]domain.Device
 	errsByCall    []error
+	// refreshBeforeCall records how many ListLocalHardware calls had
+	// happened at each Refresh.
+	refreshBeforeCall []int
+	refreshTimeouts   []int
+}
+
+func (f *fakeDiscovery) Refresh(_ context.Context, timeoutMS int) error {
+	f.refreshBeforeCall = append(f.refreshBeforeCall, f.calls)
+	f.refreshTimeouts = append(f.refreshTimeouts, timeoutMS)
+	return nil
 }
 
 func (f *fakeDiscovery) ListLocalHardware(ctx context.Context, timeoutMS int, includeUnreachable bool) ([]domain.Device, error) {
@@ -1817,6 +1827,31 @@ func TestBeamMediaResolveDeviceFallsBackToLongerDiscoveryTimeout(t *testing.T) {
 	}
 	if discovery.timeoutCalls[1] != fallbackDiscoveryTimeoutMS {
 		t.Fatalf("expected second timeout %d, got %d", fallbackDiscoveryTimeoutMS, discovery.timeoutCalls[1])
+	}
+	// The retry must follow a refresh, or it re-reads the same cached list.
+	if len(discovery.refreshBeforeCall) != 1 || discovery.refreshBeforeCall[0] != 1 {
+		t.Fatalf("expected one refresh between the first and second lookups, got %v", discovery.refreshBeforeCall)
+	}
+	if discovery.refreshTimeouts[0] != fallbackDiscoveryTimeoutMS {
+		t.Fatalf("expected refresh bounded by %d, got %d", fallbackDiscoveryTimeoutMS, discovery.refreshTimeouts[0])
+	}
+}
+
+func TestBeamMediaResolveDeviceSkipsRefreshOnFirstMatch(t *testing.T) {
+	discovery := &fakeDiscovery{devices: []domain.Device{{
+		ID:       "dev_1",
+		Name:     "Living Room TV",
+		Address:  "http://127.0.0.1:8009",
+		Protocol: "chromecast",
+	}}}
+	manager := NewManager(discovery, &fakeCastFactory{client: &fakeCastClient{}}, nil)
+	defer manager.Close(context.Background())
+
+	if _, err := manager.resolveDevice(context.Background(), "Living Room TV"); err != nil {
+		t.Fatalf("resolve device: %v", err)
+	}
+	if len(discovery.refreshBeforeCall) != 0 {
+		t.Fatalf("expected no refresh when the cached list matches, got %d", len(discovery.refreshBeforeCall))
 	}
 }
 

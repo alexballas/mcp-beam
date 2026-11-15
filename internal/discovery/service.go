@@ -30,6 +30,10 @@ type Service struct {
 	adapter adapters.Discovery
 	loopCtx context.Context
 	once    sync.Once
+	// warmed closes once the first DLNA and Chromecast scans have both
+	// finished. Before then a non-empty cache can still be partial: mDNS
+	// answers within a few hundred ms, but SSDP replies take about a second.
+	warmed chan struct{}
 }
 
 func NewService(adapter adapters.Discovery, loopCtx context.Context) *Service {
@@ -40,7 +44,40 @@ func NewService(adapter adapters.Discovery, loopCtx context.Context) *Service {
 	return &Service{
 		adapter: adapter,
 		loopCtx: loopCtx,
+		warmed:  make(chan struct{}),
 	}
+}
+
+// Start begins background discovery once per process and returns at once.
+// Calling it at server startup lets the first scans finish before the first
+// request arrives.
+func (s *Service) Start() {
+	if s.adapter == nil {
+		return
+	}
+	s.once.Do(func() {
+		s.adapter.StartDiscovery(s.loopCtx)
+		go func() {
+			defer close(s.warmed)
+			_ = s.adapter.RefreshDiscovery(s.loopCtx)
+		}()
+	})
+}
+
+// Refresh waits, up to timeoutMS, for the discovery loops to finish fresh
+// DLNA and Chromecast scans. Use it before retrying a device lookup that
+// missed, so a device that answered slowly gets a chance to appear.
+func (s *Service) Refresh(ctx context.Context, timeoutMS int) error {
+	if s.adapter == nil {
+		return errors.New("discovery adapter is not configured")
+	}
+	if timeoutMS <= 0 {
+		timeoutMS = defaultTimeoutMS
+	}
+	s.Start()
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutMS)*time.Millisecond)
+	defer cancel()
+	return s.adapter.RefreshDiscovery(ctx)
 }
 
 func (s *Service) ListLocalHardware(ctx context.Context, timeoutMS int, includeUnreachable bool) ([]domain.Device, error) {
@@ -51,9 +88,7 @@ func (s *Service) ListLocalHardware(ctx context.Context, timeoutMS int, includeU
 		timeoutMS = defaultTimeoutMS
 	}
 
-	s.once.Do(func() {
-		s.adapter.StartDiscovery(s.loopCtx)
-	})
+	s.Start()
 
 	resultCh := make(chan struct {
 		devices []devices.Device
@@ -94,8 +129,27 @@ func (s *Service) ListLocalHardware(ctx context.Context, timeoutMS int, includeU
 }
 
 func (s *Service) loadAllDevicesUntilTimeout(ctx context.Context, timeoutMS int) ([]devices.Device, error) {
-	deadline := time.NewTimer(time.Duration(timeoutMS) * time.Millisecond)
+	timeout := time.Duration(timeoutMS) * time.Millisecond
+	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
+
+	// Wait for the first full scan, or return a partial cache: the first
+	// non-empty result would otherwise be the Chromecasts alone. Stop
+	// waiting a little before the deadline so the caller's own timeout does
+	// not discard the snapshot.
+	warmWait := time.NewTimer(timeout - timeout/10)
+	defer warmWait.Stop()
+	select {
+	case <-s.warmed:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-warmWait.C:
+		loaded, err := s.adapter.LoadAllDevices()
+		if errors.Is(err, devices.ErrNoDeviceAvailable) {
+			return []devices.Device{}, nil
+		}
+		return loaded, err
+	}
 
 	poll := time.NewTicker(discoveryPollInterval)
 	defer poll.Stop()

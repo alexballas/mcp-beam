@@ -12,6 +12,9 @@ import (
 type Discovery interface {
 	StartDiscovery(ctx context.Context)
 	LoadAllDevices() ([]devices.Device, error)
+	// RefreshDiscovery waits for the running discovery loops to finish their
+	// next DLNA and Chromecast scans, so the cache reflects both protocols.
+	RefreshDiscovery(ctx context.Context) error
 }
 
 // CastClient represents a controllable Chromecast session.

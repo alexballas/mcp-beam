@@ -68,6 +68,9 @@ const (
 
 type deviceLister interface {
 	ListLocalHardware(ctx context.Context, timeoutMS int, includeUnreachable bool) ([]domain.Device, error)
+	// Refresh waits for fresh discovery scans. The cached list can be
+	// missing devices that answer slowly, such as DLNA renderers.
+	Refresh(ctx context.Context, timeoutMS int) error
 }
 
 type streamServer interface {
@@ -1049,6 +1052,12 @@ func (m *Manager) resolveDevice(ctx context.Context, target string) (*domain.Dev
 	for i, timeoutMS := range timeouts {
 		if i > 0 && timeoutMS == timeouts[i-1] {
 			continue
+		}
+		if i > 0 {
+			// The cached list missed the target. Wait for fresh scans before
+			// the retry, or it reads the same list again. A failed refresh
+			// still leaves the current cache worth checking.
+			_ = m.discovery.Refresh(ctx, timeoutMS)
 		}
 
 		devs, err := m.discovery.ListLocalHardware(ctx, timeoutMS, true)

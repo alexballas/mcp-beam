@@ -34,6 +34,10 @@ func (DiscoveryAdapter) LoadAllDevices() ([]devices.Device, error) {
 	return devices.LoadAllDevices()
 }
 
+func (DiscoveryAdapter) RefreshDiscovery(ctx context.Context) error {
+	return devices.RefreshDiscovery(ctx)
+}
+
 type CastFactory struct{}
 
 func (CastFactory) NewCastClient(deviceAddr string) (adapters.CastClient, error) {
